@@ -3,7 +3,7 @@ A CV-based biomechanical analysis system for badminton using SAM and 3D reconstr
 
 ---
 
-# 项目简介：基于单目视觉的羽毛球竞技全栈分析系统
+# 项目简介：基于单目视觉的羽毛球赛事三维场景重建与球员动作分析系统
 
 ## 🌟 项目定位
 
