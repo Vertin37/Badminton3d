@@ -29,7 +29,7 @@ A CV-based biomechanical analysis system for badminton using SAM and 3D reconstr
 
 
 4. **认知决策闭环（LLM Integration）**：
-* Step7:将提取的运动矢量（初速度、击球角度、步法频率）进行结构化处理。利用 **Qwen (通义千问)** 大模型作为决策大脑，输出专业级技术诊断报告。
+* Step7:将提取的运动矢量（初速度、击球角度、步法频率）进行结构化处理。利用 Qwen (通义千问) 大模型作为决策大脑，输出专业级技术诊断报告。
 
 
 
@@ -48,7 +48,7 @@ A CV-based biomechanical analysis system for badminton using SAM and 3D reconstr
 
 ## 🔮 后续研究建议 (Future Work)
 
-为了进一步提升系统的学术深度与工程实用性，后续研究可重点围绕“标定重建闭环”**、**“算法性能优化”**以及**“多模态大模型升级”三个维度展开：
+为了进一步提升系统的学术深度与工程实用性，后续研究可重点围绕“标定重建闭环”**、**“算法性能优化”以及“多模态大模型升级”三个维度展开：
 
 ### 1. 3D 重建与姿态估计的深度解耦与闭环
 
