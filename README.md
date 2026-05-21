@@ -15,7 +15,7 @@ A CV-based biomechanical analysis system for badminton using SAM and 3D reconstr
 
 1. **3D 场景重建与几何标定**：
 
-* Step1:通过霍夫变换与张正友标定法(可以用我做的代码，或者MATLAB的camera calibrator工具得到相机参数），实现对标准羽毛球场地的识别与重建。
+* Step1:通过pnp算法、霍夫变换与张正友标定法(可以用我做的代码，或者MATLAB的camera calibrator工具得到相机参数），实现对标准羽毛球场地的识别与重建。
 * Step2:利用 **VGGT (Visual Geometry Grounded Transformer,CVPR 2025,https://github.com/facebookresearch/vggt,可以用网页版快速复现)** 与物理几何约束，将 2D 视频流映射至 3D 空间坐标系，该步目前重建仅用于可视化展示，没有与后续工作衔接。
 
 2. **多模态目标感知**：
