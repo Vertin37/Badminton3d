@@ -16,10 +16,10 @@ A CV-based biomechanical analysis system for badminton using SAM and 3D reconstr
 1. **3D 场景重建与几何标定**：
 
 * Step1:通过pnp算法、霍夫变换与张正友标定法(可以用我做的代码，或者MATLAB的camera calibrator工具得到相机参数），实现对标准羽毛球场地的识别与重建。
-* Step2:利用 **VGGT (Visual Geometry Grounded Transformer,CVPR 2025,https://github.com/facebookresearch/vggt,可以用网页版快速复现)** 与物理几何约束，将 2D 视频流映射至 3D 空间坐标系，该步目前重建仅用于可视化展示，没有与后续工作衔接。
+* Step2:利用 **VGGT (Visual Geometry Grounded Transformer,CVPR 2025,https://github.com/facebookresearch/vggt ,可以用网页版快速复现)** 与物理几何约束，将 2D 视频流映射至 3D 空间坐标系，该步目前重建仅用于可视化展示，没有与后续工作衔接。
 
 2. **多模态目标感知**：
-* Step3:**检测与分割**：采用 **YOLO** 配合 **SAM3 (Segment Anything Model 3,https://github.com/facebookresearch/sam3,可以用网页版快速复现)**，在复杂动态背景下实现对羽毛球及球员的像素级分割。通过Step1得到的球场区域，首先使用YOLO进行粗略识别，找到羽毛球和人的框。然后再把框作为输入通过SAM3完成精细图像分割。通过这种递进式的图像分割工具，能够提升检测准确度和检测速度。
+* Step3:**检测与分割**：采用 **YOLO** 配合 **SAM3 (Segment Anything Model 3,https://github.com/facebookresearch/sam3 ,可以用网页版快速复现)**，在复杂动态背景下实现对羽毛球及球员的像素级分割。通过Step1得到的球场区域，首先使用YOLO进行粗略识别，找到羽毛球和人的框。然后再把框作为输入通过SAM3完成精细图像分割。通过这种递进式的图像分割工具，能够提升检测准确度和检测速度。
 * Step4:**姿态估计**：利用 **Sports2D** 算法提取人体 17 个核心关节的132个关键点，建立生物力学模型。
 
 
