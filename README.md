@@ -45,7 +45,6 @@ A CV-based biomechanical analysis system for badminton using SAM and 3D reconstr
 
 ---
 
----
 
 ## 🔮 后续研究建议 (Future Work)
 
@@ -57,7 +56,7 @@ A CV-based biomechanical analysis system for badminton using SAM and 3D reconstr
 
 ### 2. 运动感知算法的轻量化与实时性优化
 
-* **知识蒸馏与流水线加速**：目前“YOLO $\rightarrow$ SAM3”的递进式分割架构虽然准确度高，但由于 SAM3 模型体量大，难以满足赛事直播或现场教学的实时性（$\ge 30\text{ fps}$）需求。后续可考虑提炼模型的核心点，diy自己的识别系统。
+* **知识蒸馏与流水线加速**：目前“YOLO $\rightarrow$ SAM3”的递进式分割架构虽然准确度高，但由于 SAM3 模型体量大，难以满足赛事直播或现场教学的实时性需求。后续可考虑提炼模型的核心点，diy自己的识别系统。
 * **动态 ROI（感兴趣区域）追踪**：引入基于运动预测的动态 ROI 裁剪机制，在时序上仅对羽毛球和球员周围的局部区域调用 SAM3，大幅降低非必要区域的计算开销。
 
 ### 3. 基于多模态大模型（MLLM）的端到端战术理解
