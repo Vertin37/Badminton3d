@@ -46,7 +46,7 @@ A CV-based biomechanical analysis system for badminton using SAM and 3D reconstr
 ---
 
 
-## 🔮 后续研究建议 (Future Work)
+## 🔮 后续研究建议
 
 为了进一步提升系统的学术深度与工程实用性，后续研究可重点围绕“标定重建闭环”**、**“算法性能优化”以及“多模态大模型升级”三个维度展开：
 
