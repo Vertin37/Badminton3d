@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local data and generated outputs
+outputs/*
+!outputs/.gitkeep
+examples/data/*
+!examples/data/.gitkeep
+
+# Large media and experiment exports
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.csv
+*.trc
+*.c3d
+*.mot
+
+# Model weights and caches
+*.pt
+*.pth
+*.onnx
+*.safetensors
+.cache/
+
+# Local secrets/configs
+.env
+*.local.toml
+*.local.json
