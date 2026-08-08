@@ -90,3 +90,55 @@ outputs/         # 放分析结果、导出视频和 CSV
 ## 文档
 
 更细的脚本说明和最短复现链路见 [docs/code_overview.md](docs/code_overview.md)。
+
+## 双人持续 ID
+
+`run_pose_test.py` 现在提供跨帧双人身份保持。跟踪器使用肩、髋、膝、踝等身体关键点的加权中心、人体尺度、速度预测和归一化姿态形状进行匹配，不使用简单的左右位置作为身份。
+
+先用已有姿态 CSV 做离线验证，不会加载 RTMLib 或使用 GPU：
+
+```powershell
+python run_pose_test.py --from-csv outputs/pose_test/pose_data.csv `
+    --video outputs/pose_test/analyzed_video.mp4
+```
+
+默认生成：
+
+- `outputs/pose_test/pose_data_tracked.csv`：固定 `player_id`（同时保留兼容用的 `person_id` 列）。
+- `outputs/pose_test/tracking_debug.csv`：每帧匹配、漏检、候选数量和源检测编号。
+- `outputs/pose_test/tracking_debug.mp4`：若当前 Python 环境有 OpenCV，则生成带 `P0/P1` 标签的视频。
+
+实际运行姿态推理时使用视频模式；`--device auto` 可能选择 CUDA，确认 GPU 环境和结果后再运行：
+
+```powershell
+python run_pose_test.py --device cpu --no-display
+```
+
+## 时序滤波
+
+双人固定 ID 之后，可用 One Euro Filter 对每个 `player_id + keypoint_id` 独立平滑。该路径只读取 CSV，不导入 RTMLib、ONNX Runtime，也不会使用 GPU：
+
+```powershell
+python run_pose_test.py `
+    --filter-from-csv outputs/pose_test/pose_data_tracked.csv `
+    --output-dir outputs/pose_test `
+    --filter-fps 25
+```
+
+默认生成：
+
+- `outputs/pose_test/pose_data_stable.csv`：`x/y` 为滤波后坐标，`raw_x/raw_y` 保留原始坐标，同时包含 `filter_status`、异常拒绝和滤波覆盖标记。
+- `outputs/pose_test/temporal_filter_stats.json`：处理帧数、低置信度点、异常点、插值/保持数量以及每个 player 的覆盖率。
+
+躯干/下肢、普通关键点和手腕/手部使用不同的 One Euro 响应参数；短缺失只做有限插值或保持，长缺失保留为空。视频推理流程在生成固定 ID CSV 后也会自动写出这两个新文件。
+
+将滤波后骨架叠加回原视频进行目视检查：
+
+```powershell
+python render_stable_pose_video.py `
+    --video examples/data/test.mp4 `
+    --csv outputs/pose_test/pose_data_stable.csv `
+    --output outputs/pose_test/analyzed_video_stable.mp4
+```
+
+生成的视频中，彩色骨架是滤波后坐标，浅灰色骨架是原始坐标；加上 `--filtered-only` 可隐藏原始对照。

@@ -37,6 +37,20 @@
 | `pnp.py` | 球场角点 PnP 位姿估计 | 球场 2D/3D 对应点 | 相机位姿、3D 可视化 |
 | `10.12final.py` | 球场线、球网、3D 场景实验 | 单帧图片 | 辅助可视化图片 |
 
+### `src/court_detection/`
+
+| File | Purpose | Typical input | Output |
+|---|---|---|---|
+| `detector.py` | CPU OpenCV Canny + HoughLinesP court-line detection, filtering, and annotation | BGR video frame | court segments, direction families, heuristic roles, overlay |
+| `run_court_detection.py` | Run net/post-guided detection on keyframes and optionally render a per-frame pole-mapped/per-frame-pose video | video | JPG overlays, optional edge previews, MP4, and JSON line parameters |
+
+This is an independent image-space structure-detection path. Pole-mapping uses
+the selected net/poles plus court-line-supported ground-plane Homography to
+project four standard court sides into each frame. A guarded net-only PnP path
+is retained for missing line evidence. It does not perform 3-D scene
+reconstruction or modify player detection, ID assignment, or temporal
+filtering.
+
 ### `src/segmentation_tracking/`
 
 | 脚本 | 作用 | 典型输入 | 典型输出 |
