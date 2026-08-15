@@ -22,21 +22,24 @@ directions and a detected cross-court line provide the second depth anchor,
 and standard badminton depths (back boundary and service lines) are scored
 against all detected lines. A guarded net-only PnP fallback is retained for
 frames where the ground-line hypothesis is unavailable. The final overlay
-contains four mapped red court sides, the selected purple net segment, the
-selected post pair, the player-foot intersection, and the existing filtered
-player skeleton.
+contains the stabilized mapped court (unless `--hide-court` is used), the
+selected purple net segment, the selected post pair, and the existing filtered
+player skeleton. The player-to-player connector is hidden by default;
+`--show-player-pair-line` enables it for debugging.
 
 For a moving video, pole-mapping detects the poles and net edge on every frame
 and recomputes the ground-line Homography on every valid frame.
 The selected pair is tracked from the reference frame in both directions:
 large one-frame jumps to a neighbouring court are rejected, while the current
-frame's geometry is still used to follow camera shake. A short temporal blend
-removes Hough jitter. Before rendering, an adaptive temporal filter expresses
-the court relative to the selected net: net midpoint and direction follow
-camera motion, while the normalized court shape changes slowly. The gain is
-based on relative pole-span motion rather than fixed image coordinates, so a
-real pan or zoom can be followed but isolated line-assignment errors do not
-make the four-sided frame expand or contract. The people are still drawn from the existing
+frame's geometry is still used to follow camera shake. An intrinsic temporal
+stabilizer is applied to each accepted court model before the frame is
+annotated: large jumps are rejected, small Hough changes use a low gain, and
+the normalized court shape changes more slowly than the selected net. The gain
+is based on relative pole-span motion rather than fixed image coordinates, so a
+real pan or zoom can be followed while isolated line-assignment errors do not
+make the four-sided frame expand or contract. This is part of the
+detector/tracker itself; the rendered video does not need a later
+boundary-correction pass. The people are still drawn from the existing
 `pose_data_stable.csv` on every frame; no pose recognition code is changed.
 The line-based path does not require an assumed focal length for the 2-D court
 overlay. The PnP fallback still records its approximate focal-length
@@ -57,8 +60,14 @@ Outputs:
 - `court_detection_edges_*.jpg`: Canny/Hough previews;
 - `court_detection_video.mp4`: per-frame mapped net/post/court overlay plus
   per-frame filtered two-player skeleton;
+- `player_pole_geometry.csv`: one row for each player/pole pair, including image
+  distance/bearing, ground-plane distance/bearing, and the angle subtended by
+  the two poles at each player;
+- `player_pole_geometry.json`: coordinate-system and field metadata for later
+  3-D modeling;
 - `court_detection_lines.json`: `lines` contains only the four final boundary
   lines; `candidate_lines` retains the discarded Hough candidates for debugging.
 
 For a single frame, use `--frame 150`. For semi-automatic visual confirmation,
 use `--interactive`; frames are saved automatically and `Q` stops the preview.
+Use `--hide-court` when only the pole/player measurements should be visible.

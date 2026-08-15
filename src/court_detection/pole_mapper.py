@@ -819,39 +819,98 @@ def annotate_pole_guided_court(
     frame_bgr: np.ndarray,
     court: PoleMappedCourt,
     player_points: np.ndarray | None = None,
+    player_geometry: Sequence[dict[str, Any]] | None = None,
     show_labels: bool = True,
+    show_court: bool = True,
+    show_pole_pair_line: bool = False,
+    show_player_pair_line: bool = False,
 ) -> np.ndarray:
-    """Draw exactly four mapped court sides, the chosen net and the pole pair."""
+    """Draw the stable pole model and optional compact player geometry."""
 
     output = frame_bgr.copy()
-    polygon = np.round(court.image_corners).astype(np.int32)
-    cv2.polylines(output, [polygon.reshape(-1, 1, 2)], True, (0, 0, 255), 4, cv2.LINE_AA)
-    cv2.line(
-        output,
-        tuple(np.round(court.net_points[0]).astype(int)),
-        tuple(np.round(court.net_points[1]).astype(int)),
-        (255, 0, 255),
-        4,
-        cv2.LINE_AA,
-    )
-    cv2.line(
-        output,
-        tuple(np.round(court.pole_feet[0]).astype(int)),
-        tuple(np.round(court.pole_feet[1]).astype(int)),
-        (0, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
+    if show_court:
+        polygon = np.round(court.image_corners).astype(np.int32)
+        cv2.polylines(output, [polygon.reshape(-1, 1, 2)], True, (0, 0, 255), 4, cv2.LINE_AA)
+        cv2.line(
+            output,
+            tuple(np.round(court.net_points[0]).astype(int)),
+            tuple(np.round(court.net_points[1]).astype(int)),
+            (255, 0, 255),
+            4,
+            cv2.LINE_AA,
+        )
+    if show_pole_pair_line:
+        cv2.line(
+            output,
+            tuple(np.round(court.pole_feet[0]).astype(int)),
+            tuple(np.round(court.pole_feet[1]).astype(int)),
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
     for index, point in enumerate(court.pole_feet, start=1):
         cv2.circle(output, tuple(np.round(point).astype(int)), 8, (255, 120, 0), 3, cv2.LINE_AA)
         if show_labels:
             cv2.putText(output, f"POST {index}", tuple(np.round(point).astype(int) + np.array([8, -8])), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 120, 0), 2, cv2.LINE_AA)
-    cv2.circle(output, tuple(np.round(court.player_intersection).astype(int)), 7, (0, 255, 255), -1, cv2.LINE_AA)
     if player_points is not None:
         colors = ((0, 165, 255), (255, 180, 0))
-        cv2.line(output, tuple(np.round(player_points[0]).astype(int)), tuple(np.round(player_points[1]).astype(int)), (255, 255, 255), 2, cv2.LINE_AA)
+        if show_player_pair_line:
+            cv2.line(output, tuple(np.round(player_points[0]).astype(int)), tuple(np.round(player_points[1]).astype(int)), (255, 255, 255), 2, cv2.LINE_AA)
         for point, color in zip(player_points, colors):
             cv2.circle(output, tuple(np.round(point).astype(int)), 7, color, -1, cv2.LINE_AA)
+        geometry_by_player: dict[int, list[dict[str, Any]]] = {}
+        for row in player_geometry or []:
+            geometry_by_player.setdefault(int(row["player_id"]), []).append(row)
+        for player_id, point in enumerate(np.asarray(player_points, dtype=float)):
+            rows = sorted(geometry_by_player.get(player_id, []), key=lambda row: int(row["pole_index"]))
+            if not rows:
+                continue
+            if show_labels:
+                cv2.putText(
+                    output,
+                    f"P{player_id}",
+                    tuple(np.round(point).astype(int) + np.array([8, 18])),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    colors[player_id % len(colors)],
+                    2,
+                    cv2.LINE_AA,
+                )
+        # Keep the metric readout compact and fixed so it does not chase the
+        # moving players or cover the court geometry.
+        if show_labels and geometry_by_player:
+            metric_lines: list[str] = []
+            for player_id in sorted(geometry_by_player):
+                rows = sorted(geometry_by_player[player_id], key=lambda row: int(row["pole_index"]))
+                if len(rows) < 2:
+                    continue
+                distances = [row.get("ground_distance_m") for row in rows]
+                bearings = [row.get("ground_bearing_deg") for row in rows]
+                angle = rows[0].get("pole_subtended_angle_deg")
+                if all(value is not None for value in distances + bearings + [angle]):
+                    metric_lines.append(
+                        f"P{player_id}  POST1 {float(distances[0]):.2f}m/{float(bearings[0]):.0f}deg  "
+                        f"POST2 {float(distances[1]):.2f}m/{float(bearings[1]):.0f}deg  angle {float(angle):.0f}deg"
+                    )
+                else:
+                    pixel_distances = [float(row["image_distance_px"]) for row in rows]
+                    metric_lines.append(
+                        f"P{player_id}  POST1 {pixel_distances[0]:.0f}px  POST2 {pixel_distances[1]:.0f}px"
+                    )
+            if metric_lines:
+                top = max(42, output.shape[0] - 22 * len(metric_lines) - 14)
+                cv2.rectangle(output, (8, top - 4), (min(output.shape[1] - 8, 900), output.shape[0] - 8), (0, 0, 0), -1)
+                for line_index, text in enumerate(metric_lines):
+                    cv2.putText(
+                        output,
+                        text,
+                        (16, top + 18 + 22 * line_index),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.52,
+                        (255, 255, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
     title = f"Pole-pair court mapping | net L{court.net_line_id} | poles {court.pole_ids}"
     cv2.rectangle(output, (8, 8), (min(output.shape[1] - 8, 760), 40), (0, 0, 0), -1)
     cv2.putText(output, title, (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)

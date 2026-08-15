@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import copy
+import itertools
 import json
 import math
 import sys
@@ -32,7 +33,9 @@ if str(ROOT) not in sys.path:
 from src.court_detection import (  # noqa: E402
     CourtDetectorConfig,
     CourtLineDetector,
+    PLAYER_POLE_FIELDS,
     annotate_pole_guided_court,
+    compute_player_pole_geometry,
     recompute_pnp_ground_mapping,
     select_pole_guided_court,
 )
@@ -144,6 +147,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--no-edge-preview", action="store_true", help="do not save Canny/Hough preview images")
     parser.add_argument("--no-labels", action="store_true", help="draw lines without text labels")
     parser.add_argument(
+        "--hide-court",
+        action="store_true",
+        help="hide the red court boundary while keeping poles, players, and geometry metrics",
+    )
+    parser.add_argument(
+        "--show-pole-pair-line",
+        action="store_true",
+        help="show the line connecting the two selected poles",
+    )
+    parser.add_argument(
+        "--show-player-pair-line",
+        action="store_true",
+        help="show the line connecting the two players (hidden by default)",
+    )
+    parser.add_argument(
         "--interactive",
         action="store_true",
         help="show each annotated frame for visual confirmation; press Q to stop (frames are saved automatically)",
@@ -185,6 +203,38 @@ def _draw_pose_tracks(frame: np.ndarray, pose_points: dict, pose_frame: int | No
             colors.get(player_id, (0, 255, 0)),
             show_raw=False,
         )
+
+
+def _write_player_geometry_outputs(output_dir: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Persist stabilized player-to-pole measurements for 3-D consumers."""
+
+    csv_path = output_dir / "player_pole_geometry.csv"
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PLAYER_POLE_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    valid_rows = sum(bool(row.get("metric_valid")) for row in rows)
+    frames = sorted({int(row["frame_id"]) for row in rows})
+    metadata = {
+        "csv": str(csv_path),
+        "row_count": len(rows),
+        "valid_metric_rows": int(valid_rows),
+        "frame_count": len(frames),
+        "coordinate_system": {
+            "origin": "selected net center on the court ground plane",
+            "x_axis": "across the net, metres",
+            "y_axis": "along the court, metres",
+            "pole_positions_m": [[-3.05, 0.0], [3.05, 0.0]],
+            "ground_bearing": "degrees from player to pole, atan2(y, x)",
+            "pole_subtended_angle": "angle at the player between the two pole vectors",
+        },
+        "fields": PLAYER_POLE_FIELDS,
+    }
+    json_path = output_dir / "player_pole_geometry.json"
+    json_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    metadata["json"] = str(json_path)
+    return metadata
 
 
 def _pole_model_motion(first: Any, second: Any) -> float:
@@ -391,16 +441,18 @@ def _smooth_tracked_pole_models(
     models: list[Any | None],
     anchor_frame: int | None,
 ) -> list[Any | None]:
-    """Smooth both sides of the trusted anchor without changing court identity."""
+    """Return pole-tracked models without a second recursive geometry filter.
 
-    if anchor_frame is None or not models:
-        return models
-    smoothed: list[Any | None] = [None] * len(models)
-    forward = _smooth_pole_model_sequence(models, list(range(anchor_frame, len(models))))
-    backward = _smooth_pole_model_sequence(models, list(range(anchor_frame, -1, -1)))
-    for index, model in {**backward, **forward}.items():
-        smoothed[index] = model
-    return smoothed
+    ``_track_pole_models`` already applies motion gating, jump rejection,
+    missing-frame holds, and adaptive per-frame blending.  Applying another
+    one-sided recursive filter from the anchor can accumulate small normalized
+    shape errors over hundreds of frames, expanding or shrinking the mapped
+    court at the far end of the sequence.  Keep the first, observation-backed
+    tracker as the single temporal source of truth.
+    """
+
+    del anchor_frame
+    return models
 
 
 def _correct_majority_geometry_outliers(
@@ -508,7 +560,7 @@ def _blend_pole_models(
     height: int,
     motion_px: float,
 ) -> Any:
-    """Smooth a valid current detection while recomputing its PnP mapping."""
+    """Accept a valid detection through the intrinsic boundary stabilizer."""
 
     corner_motion_px = float(
         np.max(
@@ -519,20 +571,31 @@ def _blend_pole_models(
             )
         )
     )
-    # Keep most of the current detection so camera movement is followed, while
-    # damping one-frame Hough jitter.  A larger motion gets less smoothing.
-    alpha = 0.80 if corner_motion_px < 70.0 else 0.92
+    # Use low gain for Hough jitter and higher gain only for genuine relative
+    # camera motion.  This filtering is part of model selection before the
+    # output video is rendered; no second-pass video correction is required.
+    pole_span = float(np.linalg.norm(np.asarray(current.pole_feet[1]) - np.asarray(current.pole_feet[0])))
+    corner_motion_ratio = corner_motion_px / max(20.0, pole_span)
+    if corner_motion_ratio < 0.025:
+        alpha = 0.06
+    elif corner_motion_ratio < 0.07:
+        alpha = 0.12
+    elif corner_motion_ratio < 0.14:
+        alpha = 0.24
+    else:
+        alpha = 0.38
     model = copy.deepcopy(current)
     for field_name in ("pole_feet", "net_points", "player_intersection", "image_corners"):
         previous_value = np.asarray(getattr(previous, field_name), dtype=float)
         current_value = np.asarray(getattr(current, field_name), dtype=float)
         setattr(model, field_name, alpha * current_value + (1.0 - alpha) * previous_value)
 
-    mapping_name = str(model.diagnostics.get("mapping", ""))
     try:
-        if mapping_name.startswith("ground_plane_homography"):
+        image_corners = np.asarray(model.image_corners, dtype=np.float32)
+        world_corners = np.asarray(model.world_corners, dtype=np.float32)
+        if image_corners.shape == (4, 2) and world_corners.shape == (4, 2) and np.isfinite(image_corners).all():
             source_corners = np.asarray(model.world_corners, dtype=np.float32)
-            target_corners = np.asarray(model.image_corners, dtype=np.float32)
+            target_corners = image_corners
             model.homography_world_to_image = cv2.getPerspectiveTransform(
                 source_corners,
                 target_corners,
@@ -553,10 +616,11 @@ def _blend_pole_models(
     model.diagnostics = dict(model.diagnostics)
     model.diagnostics.update(
         {
-            "temporal_tracking": "accepted_current_detection_and_recomputed_mapping",
+            "temporal_tracking": "accepted_current_detection_and_intrinsic_boundary_stabilization",
             "temporal_blend_alpha": round(float(alpha), 4),
             "temporal_motion_px": round(float(motion_px), 3),
             "temporal_corner_motion_px": round(float(corner_motion_px), 3),
+            "temporal_corner_motion_ratio": round(float(corner_motion_ratio), 5),
         }
     )
     return model
@@ -574,6 +638,79 @@ def _hold_pole_model(model: Any, reason: str, source_frame: int) -> Any:
         }
     )
     return held
+
+
+def _align_court_corner_order(current: Any, reference: Any) -> Any:
+    """Align cyclic/reversed detector corner order before temporal blending."""
+
+    current_corners = np.asarray(current.image_corners, dtype=float)
+    reference_corners = np.asarray(reference.image_corners, dtype=float)
+    if current_corners.shape != (4, 2) or reference_corners.shape != (4, 2):
+        return current
+    if not np.isfinite(current_corners).all() or not np.isfinite(reference_corners).all():
+        return current
+
+    permutation = min(
+        itertools.permutations(range(4)),
+        key=lambda candidate: float(
+            np.sum(
+                np.linalg.norm(
+                    current_corners[list(candidate)] - reference_corners,
+                    axis=1,
+                )
+            )
+        ),
+    )
+    if permutation == (0, 1, 2, 3):
+        return current
+
+    aligned = copy.deepcopy(current)
+    aligned.image_corners = current_corners[list(permutation)]
+    mapping_name = str(aligned.diagnostics.get("mapping", ""))
+    if mapping_name.startswith("ground_plane_homography"):
+        aligned.homography_world_to_image = cv2.getPerspectiveTransform(
+            np.asarray(aligned.world_corners, dtype=np.float32),
+            aligned.image_corners.astype(np.float32),
+        )
+    aligned.diagnostics = dict(aligned.diagnostics)
+    aligned.diagnostics.update(
+        {
+            "corner_order_aligned": True,
+            "corner_order_permutation": list(permutation),
+        }
+    )
+    return aligned
+
+
+def _align_pole_endpoint_order(current: Any, reference: Any) -> Any:
+    """Keep the selected pole pair's left/right endpoint order continuous."""
+
+    current_feet = np.asarray(current.pole_feet, dtype=float)
+    reference_feet = np.asarray(reference.pole_feet, dtype=float)
+    if current_feet.shape != (2, 2) or reference_feet.shape != (2, 2):
+        return current
+    direct_cost = float(np.sum(np.linalg.norm(current_feet - reference_feet, axis=1)))
+    swapped_cost = float(np.sum(np.linalg.norm(current_feet[::-1] - reference_feet, axis=1)))
+    aligned = copy.deepcopy(current)
+    if direct_cost > swapped_cost:
+        aligned.pole_feet = current_feet[::-1]
+        net_points = np.asarray(aligned.net_points, dtype=float)
+        if net_points.shape == (2, 2):
+            aligned.net_points = net_points[::-1]
+    aligned.diagnostics = dict(aligned.diagnostics)
+    # Component labels are local to each frame.  Preserve the anchor's
+    # endpoint IDs after spatial order alignment so CSV consumers never see a
+    # fake pole identity switch when OpenCV renumbers connected components.
+    reference_ids = tuple(reference.pole_ids)
+    if len(reference_ids) == 2:
+        aligned.pole_ids = reference_ids
+    aligned.diagnostics.update(
+        {
+            "pole_endpoint_order_aligned": bool(direct_cost > swapped_cost),
+            "pole_endpoint_order_method": "nearest_previous_pair_with_anchor_ids",
+        }
+    )
+    return aligned
 
 
 def _track_pole_models(
@@ -609,6 +746,8 @@ def _track_pole_models(
             if current is None:
                 tracked[index] = _hold_pole_model(previous, "held_previous_detection_missing", previous_index)
             else:
+                current = _align_pole_endpoint_order(current, previous)
+                current = _align_court_corner_order(current, previous)
                 motion_px = _pole_model_motion(previous, current)
                 corner_motion_px = float(
                     np.max(
@@ -658,6 +797,9 @@ def run(
     video_output: Path | None = None,
     reference_frame: int | None = None,
     pole_mapping: bool = False,
+    show_court: bool = True,
+    show_pole_pair_line: bool = False,
+    show_player_pair_line: bool = False,
 ) -> dict[str, Any]:
     if not video_path.exists():
         raise FileNotFoundError(f"video not found: {video_path}")
@@ -683,6 +825,7 @@ def run(
     if use_target_filter and not frame_pairs:
         print("[WARN] no two-player ankle targets found; falling back to all Hough candidates")
     records: list[dict] = []
+    player_geometry_rows: list[dict[str, Any]] = []
     video_path_out: Path | None = None
     video_mapping_stats: dict[str, Any] = {}
     try:
@@ -707,13 +850,19 @@ def run(
             )
             target_selected = mapped_court is not None if pole_mapping else result.target_court is not None
             if pole_mapping and mapped_court is not None:
+                geometry = compute_player_pole_geometry(mapped_court, player_points, frame_index)
                 annotated = annotate_pole_guided_court(
                     image,
                     mapped_court,
                     player_points=player_points,
+                    player_geometry=geometry,
                     show_labels=show_labels,
+                    show_court=show_court,
+                    show_pole_pair_line=show_pole_pair_line,
+                    show_player_pair_line=show_player_pair_line,
                 )
             else:
+                geometry = []
                 annotated = detector.annotate(
                     image,
                     result,
@@ -729,6 +878,7 @@ def run(
 
             record = result.as_dict()
             record["pole_mapped_court"] = None if mapped_court is None else mapped_court.as_dict()
+            record["player_pole_geometry"] = geometry
             record["annotated_image"] = str(output_path)
             record["target_pose_frame"] = pose_frame
             if save_edges:
@@ -816,13 +966,28 @@ def run(
                     tracked_models,
                     mapping_anchor_frame,
                 )
+                player_geometry_by_frame: dict[int, list[dict[str, Any]]] = {}
+                for model_index, tracked_model in enumerate(tracked_models):
+                    if tracked_model is None:
+                        continue
+                    _, tracked_points = _nearest_player_pair(frame_pairs, model_index)
+                    if tracked_points is None:
+                        continue
+                    frame_geometry = compute_player_pole_geometry(
+                        tracked_model,
+                        tracked_points,
+                        model_index,
+                    )
+                    if frame_geometry:
+                        player_geometry_by_frame[model_index] = frame_geometry
+                        player_geometry_rows.extend(frame_geometry)
                 video_mapping_stats = {
                     "raw_valid_frames": int(sum(item is not None for item in raw_models)),
                     "total_frames": int(len(raw_models)),
                     "tracked_model_frames": int(sum(item is not None for item in tracked_models)),
                     "anchor_frame": mapping_anchor_frame,
                     "recomputed_per_frame": True,
-                    "temporal_filter": "adaptive_pole_basis_filter",
+                    "temporal_filter": "pole_pair_motion_gate_and_adaptive_blend",
                     "majority_geometry_corrections": int(majority_correction_count),
                     "line_ground_homography_frames": int(
                         sum(
@@ -873,7 +1038,11 @@ def run(
                                 image,
                                 mapped_model,
                                 player_points=current_points,
+                                player_geometry=player_geometry_by_frame.get(video_frame_index, []),
                                 show_labels=show_labels,
+                                show_court=show_court,
+                                show_pole_pair_line=show_pole_pair_line,
+                                show_player_pair_line=show_player_pair_line,
                             )
                         else:
                             annotated = image.copy()
@@ -883,17 +1052,29 @@ def run(
                             if mapping_anchor_frame is not None
                             else "none"
                         )
+                        # Keep the run-status text below the title instead of
+                        # placing it over the fixed geometry readout.
+                        cv2.rectangle(
+                            annotated,
+                            (8, 46),
+                            (min(video_width - 8, 760), 74),
+                            (0, 0, 0),
+                            -1,
+                        )
                         cv2.putText(
                             annotated,
                             f"Per-frame pole mapping | anchor {anchor_text} | video frame {video_frame_index}",
-                            (18, video_height - 18),
+                            (16, 66),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.55,
+                            0.48,
                             (255, 255, 255),
-                            2,
+                            1,
                             cv2.LINE_AA,
                         )
                         writer.write(annotated)
+                        if video_frame_index in indices:
+                            frame_output = output_dir / f"court_detection_frame_{video_frame_index:06d}.jpg"
+                            cv2.imwrite(str(frame_output), annotated)
                         video_frame_index += 1
                 finally:
                     writer.release()
@@ -960,6 +1141,11 @@ def run(
     finally:
         cap.release()
 
+    if not player_geometry_rows:
+        for record in records:
+            player_geometry_rows.extend(record.get("player_pole_geometry", []))
+    player_geometry_metadata = _write_player_geometry_outputs(output_dir, player_geometry_rows)
+
     metadata = {
         "video": str(video_path),
         "frame_count": video_frame_count,
@@ -984,8 +1170,14 @@ def run(
         "per_frame_mapping": bool(pole_mapping and (all_frames or video_output is not None)),
         "video_output": None if video_path_out is None else str(video_path_out),
         "video_mapping_stats": video_mapping_stats,
+        "player_pole_geometry": player_geometry_metadata,
+        "render_options": {
+            "show_court": bool(show_court),
+            "show_pole_pair_line": bool(show_pole_pair_line),
+            "show_player_pair_line": bool(show_player_pair_line),
+        },
         "frames": records,
-        "scope": "image-space court structure only; no homography or 3-D reconstruction",
+        "scope": "2-D court/pole tracking plus ground-plane player-to-pole geometry; no full camera or human 3-D reconstruction",
     }
     json_path = output_dir / "court_detection_lines.json"
     json_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1010,6 +1202,9 @@ def main() -> None:
         video_output=args.video_output,
         reference_frame=args.reference_frame,
         pole_mapping=args.pole_mapping,
+        show_court=not args.hide_court,
+        show_pole_pair_line=args.show_pole_pair_line,
+        show_player_pair_line=args.show_player_pair_line,
     )
 
 

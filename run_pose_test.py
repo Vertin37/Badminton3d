@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterable, Optional
@@ -27,6 +29,11 @@ STABLE_CSV_NAME = "pose_data_stable.csv"
 FILTER_STATS_NAME = "temporal_filter_stats.json"
 TRACKED_VIDEO_NAME = "analyzed_video_tracked.mp4"
 DEBUG_VIDEO_NAME = "tracking_debug.mp4"
+
+# Keep Windows DLL-directory handles alive for the whole process.  ONNX
+# Runtime 1.23.2's Windows preload list omits cuDNN's tensor-IR engine DLL,
+# while cuDNN 9.25 loads it lazily on the first convolution.
+_CUDA_DLL_DIR_HANDLES: list[object] = []
 
 TRACKED_CSV_FIELDS = [
     "frame_id",
@@ -450,6 +457,38 @@ def _select_device(requested: str, providers: list[str]) -> str:
     return "cuda" if "CUDAExecutionProvider" in providers else "cpu"
 
 
+def _prepare_cuda_runtime(ort: object) -> None:
+    """Make the bundled CUDA/cuDNN DLLs discoverable before RTMLib loads."""
+
+    site_packages = Path(ort.__file__).resolve().parents[1]
+    nvidia_root = site_packages / "nvidia"
+    dll_dirs = [
+        nvidia_root / "cublas" / "bin",
+        nvidia_root / "cuda_runtime" / "bin",
+        nvidia_root / "cuda_nvrtc" / "bin",
+        nvidia_root / "nvjitlink" / "bin",
+        nvidia_root / "cudnn" / "bin",
+    ]
+    for dll_dir in dll_dirs:
+        if not dll_dir.is_dir():
+            continue
+        os.environ["PATH"] = str(dll_dir) + os.pathsep + os.environ.get("PATH", "")
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if add_dll_directory is not None:
+            _CUDA_DLL_DIR_HANDLES.append(add_dll_directory(str(dll_dir)))
+
+    # Preserve the standard ONNX Runtime preload path used by the project.
+    preload_dlls = getattr(ort, "preload_dlls", None)
+    if preload_dlls is not None:
+        preload_dlls(directory="")
+
+    # ORT 1.23.2 does not preload this cuDNN 9 engine DLL on Windows, but
+    # cuDNN may require it when building a convolution frontend graph.
+    tensor_ir_dll = nvidia_root / "cudnn" / "bin" / "cudnn_engines_tensor_ir64_9.dll"
+    if tensor_ir_dll.is_file():
+        ctypes.CDLL(str(tensor_ir_dll))
+
+
 def run_video_inference(
     video_path: Path,
     output_dir: Path,
@@ -466,8 +505,8 @@ def run_video_inference(
 
     providers = ort.get_available_providers()
     device = _select_device(requested_device, providers)
-    if device == "cuda" and hasattr(ort, "preload_dlls"):
-        ort.preload_dlls(directory="")
+    if device == "cuda":
+        _prepare_cuda_runtime(ort)
 
     from rtmlib import Wholebody, draw_skeleton
 

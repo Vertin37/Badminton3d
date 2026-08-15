@@ -42,6 +42,7 @@
 | File | Purpose | Typical input | Output |
 |---|---|---|---|
 | `detector.py` | CPU OpenCV Canny + HoughLinesP court-line detection, filtering, and annotation | BGR video frame | court segments, direction families, heuristic roles, overlay |
+| `player_pole_geometry.py` | Project filtered player feet to the court plane and compute pole distances, bearings, and subtended angles | stabilized pole-mapped court + two player feet | per-player/per-pole geometry rows |
 | `run_court_detection.py` | Run net/post-guided detection on keyframes and optionally render a per-frame pole-mapped/per-frame-pose video | video | JPG overlays, optional edge previews, MP4, and JSON line parameters |
 
 This is an independent image-space structure-detection path. Pole-mapping uses

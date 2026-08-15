@@ -27,6 +27,13 @@ examples/data/*
 *.safetensors
 .cache/
 
+# Local-only model archive and upstream checkout (kept on this Windows PC).
+models_smplx_v1_1.zip
+work/GVHMR/
+
+# Editor-local settings
+.vscode/
+
 # Local secrets/configs
 .env
 *.local.toml

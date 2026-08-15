@@ -9,6 +9,7 @@ from .pole_mapper import (
     recompute_pnp_ground_mapping,
     select_pole_guided_court,
 )
+from .player_pole_geometry import PLAYER_POLE_FIELDS, compute_player_pole_geometry
 from .target_selector import SelectedCourt
 
 __all__ = [
@@ -23,4 +24,6 @@ __all__ = [
     "detect_pole_candidates",
     "recompute_pnp_ground_mapping",
     "select_pole_guided_court",
+    "PLAYER_POLE_FIELDS",
+    "compute_player_pole_geometry",
 ]
