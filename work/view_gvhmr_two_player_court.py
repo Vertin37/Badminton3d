@@ -19,6 +19,32 @@ DEFAULT_BUNDLE = (
     / "two_player_smplx_court_animation.npz"
 )
 
+# Standard indoor badminton mats are commonly a dark, low-glare green.  Keep
+# the surface slightly below Z=0 so the white court markings and planted feet
+# remain crisp instead of z-fighting with the floor triangles.
+COURT_GREEN = (0.08, 0.42, 0.22)
+COURT_SURFACE_Z = -0.006
+
+
+def _court_surface(width: float, length: float) -> o3d.geometry.TriangleMesh:
+    half_w, half_l = width / 2.0, length / 2.0
+    vertices = np.array(
+        [
+            [-half_w, -half_l, COURT_SURFACE_Z],
+            [half_w, -half_l, COURT_SURFACE_Z],
+            [half_w, half_l, COURT_SURFACE_Z],
+            [-half_w, half_l, COURT_SURFACE_Z],
+        ],
+        dtype=np.float64,
+    )
+    surface = o3d.geometry.TriangleMesh(
+        vertices=o3d.utility.Vector3dVector(vertices),
+        triangles=o3d.utility.Vector3iVector(np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)),
+    )
+    surface.compute_vertex_normals()
+    surface.paint_uniform_color(COURT_GREEN)
+    return surface
+
 
 def _court_lines(width: float, length: float, net_height: float) -> o3d.geometry.LineSet:
     half_w, half_l = width / 2.0, length / 2.0
@@ -57,11 +83,17 @@ def view(bundle_path: Path) -> None:
     fps = float(data["fps"])
     mesh0 = _make_mesh(p0[0], faces, (0.12, 0.52, 0.96))
     mesh1 = _make_mesh(p1[0], faces, (1.0, 0.42, 0.12))
-    court = _court_lines(float(data["court_width_m"]), float(data["court_length_m"]), float(data["net_height_m"]))
+    surface = _court_surface(float(data["court_width_m"]), float(data["court_length_m"]))
+    court = _court_lines(
+        float(data["court_width_m"]),
+        float(data["court_length_m"]),
+        float(data["net_height_m"]),
+    )
 
     state = {"frame": 0, "playing": False, "last": time.monotonic()}
     visualizer = o3d.visualization.VisualizerWithKeyCallback()
     visualizer.create_window("BadmintonPose — native GVHMR SMPL-X", width=1280, height=800)
+    visualizer.add_geometry(surface)
     visualizer.add_geometry(court)
     visualizer.add_geometry(mesh0)
     visualizer.add_geometry(mesh1)

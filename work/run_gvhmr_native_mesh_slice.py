@@ -36,14 +36,21 @@ def _load_tensor(path: Path):
     return torch.load(path, map_location="cpu")
 
 
-def _slice_cached_data(cache_root: Path, start: int, end: int, f_mm: int) -> tuple[dict, int, int]:
+def _slice_cached_data(
+    source_video: Path,
+    cache_root: Path,
+    start: int,
+    end: int,
+    f_mm: int,
+    static_camera: bool,
+) -> tuple[dict, int, int]:
     """Load and slice existing official-demo cache without copying a video."""
     sys.path.insert(0, str(GVHMR_ROOT))
     from hmr4d.utils.geo.hmr_cam import create_camera_sensor
     from hmr4d.utils.geo_transform import compute_cam_angvel
     from hmr4d.utils.video_io_utils import get_video_lwh
 
-    length, width, height = get_video_lwh(SOURCE_VIDEO)
+    length, width, height = get_video_lwh(source_video)
     if not (0 <= start < end <= length):
         raise ValueError(f"Invalid frame range [{start}, {end}) for {length}-frame video")
 
@@ -51,18 +58,25 @@ def _slice_cached_data(cache_root: Path, start: int, end: int, f_mm: int) -> tup
     bbx_xys = _load_tensor(preprocess / "bbx.pt")["bbx_xys"]
     kp2d = _load_tensor(preprocess / "vitpose.pt")
     f_imgseq = _load_tensor(preprocess / "vit_features.pt")
-    slam = _load_tensor(preprocess / "slam_results.pt")
+    slam = None if static_camera else _load_tensor(preprocess / "slam_results.pt")
 
     expected = length
-    for label, tensor in (("bbx_xys", bbx_xys), ("kp2d", kp2d), ("f_imgseq", f_imgseq), ("slam", slam)):
+    cached_tensors = [("bbx_xys", bbx_xys), ("kp2d", kp2d), ("f_imgseq", f_imgseq)]
+    if slam is not None:
+        cached_tensors.append(("slam", slam))
+    for label, tensor in cached_tensors:
         if len(tensor) != expected:
             raise ValueError(f"Cached {label} has {len(tensor)} frames; expected {expected}")
 
-    # This is the exact SimpleVO branch used by the official demo.  Camera
-    # rotation is intentionally retained; this clip is not treated as a
-    # synthetic static-camera sequence.
-    r_w2c = torch.as_tensor(slam[:, :3, :3]).float()
-    cam_angvel = compute_cam_angvel(r_w2c)
+    if static_camera:
+        # The official GVHMR demo exposes the same static-camera choice via
+        # ``-s``.  Do not inject noisy SimpleVO angular velocity when the
+        # source is a genuinely fixed tripod view.
+        cam_angvel = torch.zeros((length, 6), dtype=torch.float32)
+    else:
+        assert slam is not None
+        r_w2c = torch.as_tensor(slam[:, :3, :3]).float()
+        cam_angvel = compute_cam_angvel(r_w2c)
     k_fullimg = create_camera_sensor(width, height, f_mm)[2].repeat(end - start, 1, 1)
 
     data = {
@@ -121,6 +135,7 @@ def _render_camera_overlay(
     start: int,
     width: int,
     height: int,
+    source_video: Path,
 ) -> None:
     """Render native SMPL-X vertices over the original video; no synthetic skeleton."""
     from hmr4d.utils.vis.renderer import Renderer
@@ -129,9 +144,9 @@ def _render_camera_overlay(
     # rasterizer bin at 1280x720.  The naive mode is slower but guarantees a
     # complete mesh image for this short visual validation.
     renderer = Renderer(width, height, device="cuda", faces=faces, K=k_fullimg[0], bin_size=0)
-    capture = cv2.VideoCapture(str(SOURCE_VIDEO))
+    capture = cv2.VideoCapture(str(source_video))
     if not capture.isOpened():
-        raise RuntimeError(f"Cannot open source video: {SOURCE_VIDEO}")
+        raise RuntimeError(f"Cannot open source video: {source_video}")
     capture.set(cv2.CAP_PROP_POS_FRAMES, start)
     writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (width, height))
     if not writer.isOpened():
@@ -152,6 +167,11 @@ def _render_camera_overlay(
 
 
 def run(args: argparse.Namespace) -> None:
+    # GVHMR is imported after changing to its repository directory. Resolve
+    # caller-supplied paths first so relative CLI paths remain project-relative.
+    args.video = args.video.resolve()
+    args.cache_root = args.cache_root.resolve()
+    args.output_dir = args.output_dir.resolve()
     if not torch.cuda.is_available():
         raise RuntimeError("GVHMR native mesh validation requires CUDA, but CUDA is unavailable")
     model_file = GVHMR_ROOT / "inputs" / "checkpoints" / "body_models" / "smplx" / "SMPLX_NEUTRAL.npz"
@@ -162,7 +182,14 @@ def run(args: argparse.Namespace) -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     os.chdir(GVHMR_ROOT)
-    data, width, height = _slice_cached_data(args.cache_root, args.start_frame0, args.end_frame0, args.f_mm)
+    data, width, height = _slice_cached_data(
+        args.video,
+        args.cache_root,
+        args.start_frame0,
+        args.end_frame0,
+        args.f_mm,
+        args.static_camera,
+    )
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     model, cfg = _make_model()
@@ -170,7 +197,7 @@ def run(args: argparse.Namespace) -> None:
     # DemoPL.predict is the official inference entry.  Unlike the deleted
     # validation runner, it always calls Pipeline.forward(..., postproc=True).
     with torch.no_grad():
-        prediction = model.predict(data, static_cam=False)
+        prediction = model.predict(data, static_cam=args.static_camera)
 
     params_global = _to_cpu_params(prediction["smpl_params_global"])
     params_incam = _to_cpu_params(prediction["smpl_params_incam"])
@@ -228,17 +255,18 @@ def run(args: argparse.Namespace) -> None:
             args.start_frame0,
             width,
             height,
+            args.video,
         )
 
     root_steps = np.linalg.norm(np.diff(root, axis=0), axis=1)
     metadata = {
-        "source_video": str(SOURCE_VIDEO),
+        "source_video": str(args.video),
         "source_cache": str(args.cache_root),
         "source_frame_range_zero_based_end_exclusive": [args.start_frame0, args.end_frame0],
         "frames": int(len(vertices_global)),
         "method": "GVHMR native post-processing + licensed SMPL-X v1.1 neutral mesh",
         "official_postproc": True,
-        "camera_motion": "cached official SimpleVO",
+        "camera_motion": "static camera; zero angular velocity" if args.static_camera else "cached official SimpleVO",
         "uses_custom_3d_skeleton": False,
         "smplx_vertices_per_frame": int(vertices_global.shape[1]),
         "smplx_faces": int(len(faces)),
@@ -267,13 +295,23 @@ def run(args: argparse.Namespace) -> None:
 
 def rerender_existing_overlay(args: argparse.Namespace) -> None:
     """Replace only an overlay rendered with an unsuitable rasterizer setting."""
+    args.video = args.video.resolve()
+    args.cache_root = args.cache_root.resolve()
+    args.output_dir = args.output_dir.resolve()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable")
     result_path = args.output_dir / "1_hmr4d_results_native.pt"
     if not result_path.exists():
         raise FileNotFoundError(f"Native result is missing: {result_path}")
     os.chdir(GVHMR_ROOT)
-    data, width, height = _slice_cached_data(args.cache_root, args.start_frame0, args.end_frame0, args.f_mm)
+    data, width, height = _slice_cached_data(
+        args.video,
+        args.cache_root,
+        args.start_frame0,
+        args.end_frame0,
+        args.f_mm,
+        args.static_camera,
+    )
     result = torch.load(result_path, map_location="cpu")
     from hmr4d.utils.smplx_utils import make_smplx
 
@@ -289,6 +327,7 @@ def rerender_existing_overlay(args: argparse.Namespace) -> None:
         args.start_frame0,
         width,
         height,
+        args.video,
     )
     record_path = args.output_dir / "experiment_record.json"
     record = json.loads(record_path.read_text(encoding="utf-8"))
@@ -299,11 +338,13 @@ def rerender_existing_overlay(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--video", type=Path, default=SOURCE_VIDEO)
     parser.add_argument("--cache-root", type=Path, default=SOURCE_CACHE_ROOT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--start-frame0", type=int, default=120)
     parser.add_argument("--end-frame0", type=int, default=240)
     parser.add_argument("--f-mm", type=int, default=24)
+    parser.add_argument("--static-camera", action="store_true")
     parser.add_argument("--render-overlay", action="store_true")
     parser.add_argument("--rerender-overlay-only", action="store_true")
     args = parser.parse_args()

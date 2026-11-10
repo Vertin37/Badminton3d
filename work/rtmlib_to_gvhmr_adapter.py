@@ -25,7 +25,6 @@ DEFAULT_GVHMR_ROOT = PROJECT / "work" / "GVHMR"
 DEFAULT_CSV = PROJECT / "outputs" / "test2_analysis" / "pose_data_stable.csv"
 DEFAULT_VIDEO = PROJECT / "examples" / "data" / "test2.mp4"
 DEFAULT_CLIP = PROJECT / "outputs" / "world_hmr_test" / "test2_f120_240.mp4"
-DEFAULT_SIMPLEVO = PROJECT / "outputs" / "world_hmr_test" / "simplevo_trajectory.npz"
 DEFAULT_OUTPUT = PROJECT / "outputs" / "world_hmr_test" / "gvhmr_rtmlib_p0"
 
 COCO17 = 17
@@ -133,8 +132,8 @@ def _load_clip_keypoints(
     )
 
 
-def _save_slam_if_available(simplevo_npz: Path, output_path: Path) -> bool:
-    if not simplevo_npz.exists():
+def _save_slam_if_available(simplevo_npz: Path | None, output_path: Path) -> bool:
+    if simplevo_npz is None or not simplevo_npz.exists():
         return False
     data = np.load(simplevo_npz)
     if "T_w2c" not in data:
@@ -149,11 +148,14 @@ def build_adapter(
     video_path: Path,
     clip_path: Path,
     output_root: Path,
-    simplevo_npz: Path,
+    simplevo_npz: Path | None,
     player_id: int,
     start_frame0: int,
     end_frame0: int,
-) -> None:
+    extract_features: bool = False,
+    compute_simplevo: bool = False,
+    focal_mm: int = 24,
+) -> Path:
     cap = cv2.VideoCapture(str(clip_path))
     if not cap.isOpened():
         raise RuntimeError(f"无法打开短片: {clip_path}")
@@ -180,6 +182,26 @@ def build_adapter(
     torch.save(kp2d, preprocess_dir / "rtmlib_kp2d.pt")
     slam_saved = _save_slam_if_available(simplevo_npz, preprocess_dir / "slam_results.pt")
 
+    feature_path = preprocess_dir / "vit_features.pt"
+    if extract_features and not feature_path.exists():
+        if not torch.cuda.is_available():
+            raise RuntimeError("HMR2 feature extraction requires CUDA")
+        from hmr4d.utils.preproc import Extractor
+
+        extractor = Extractor()
+        features = extractor.extract_video_features(str(clip_path.resolve()), bbx_xys)
+        torch.save(features, feature_path)
+        del extractor, features
+        torch.cuda.empty_cache()
+
+    slam_path = preprocess_dir / "slam_results.pt"
+    if compute_simplevo and not slam_path.exists():
+        from hmr4d.utils.preproc import SimpleVO
+
+        simple_vo = SimpleVO(str(clip_path.resolve()), scale=0.5, step=8, method="sift", f_mm=focal_mm)
+        torch.save(simple_vo.compute(), slam_path)
+        slam_saved = True
+
     metadata = {
         "method": "GVHMR with existing BadmintonPose RTMLib COCO17 keypoints",
         "official_vitpose_bypassed": True,
@@ -192,6 +214,7 @@ def build_adapter(
         "shape_kp2d": list(kp2d.shape),
         "shape_bbx_xys": list(bbx_xys.shape),
         "simplevo_cached": slam_saved,
+        "hmr2_features_cached": feature_path.exists(),
         **stats,
         "note": "kp2d is RTMLib Wholebody first 17 COCO keypoints; HMR2 image features are still required.",
     }
@@ -199,6 +222,7 @@ def build_adapter(
         json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(json.dumps({"preprocess_dir": str(preprocess_dir), **metadata}, ensure_ascii=False))
+    return preprocess_dir.parent
 
 
 def main() -> None:
@@ -207,7 +231,10 @@ def main() -> None:
     parser.add_argument("--video", type=Path, default=DEFAULT_VIDEO)
     parser.add_argument("--clip", type=Path, default=DEFAULT_CLIP)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--simplevo", type=Path, default=DEFAULT_SIMPLEVO)
+    parser.add_argument("--simplevo", type=Path)
+    parser.add_argument("--extract-features", action="store_true")
+    parser.add_argument("--compute-simplevo", action="store_true")
+    parser.add_argument("--f-mm", type=int, default=24)
     parser.add_argument("--player-id", type=int, default=0)
     parser.add_argument("--start-frame0", type=int, default=120)
     parser.add_argument("--end-frame0", type=int, default=240)
@@ -221,6 +248,9 @@ def main() -> None:
         player_id=args.player_id,
         start_frame0=args.start_frame0,
         end_frame0=args.end_frame0,
+        extract_features=args.extract_features,
+        compute_simplevo=args.compute_simplevo,
+        focal_mm=args.f_mm,
     )
 
 

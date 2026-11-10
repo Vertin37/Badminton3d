@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 2026-11-10 — Stable 3D workflow publication
+
+- Added the automatic video-to-3D pipeline, fixed-camera GVHMR handling, and tracked calibration export.
+- Added monocular depth alignment, Metric Video Depth Anything orchestration, multi-cue trajectory fusion, and support-foot refinement.
+- Improved spectator rejection, court-coordinate compatibility, contact correction speed limits, and final trajectory bounds.
+- Included the supporting geometry interfaces, regression tests, and reproducible workflow documentation.
+- Excluded the separate learned court-localization, annotation/training, and multi-view recognition experiments.
+
+## Earlier stable 2D milestone
 
 ### Added
 

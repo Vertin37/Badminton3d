@@ -489,6 +489,79 @@ def _prepare_cuda_runtime(ort: object) -> None:
         ctypes.CDLL(str(tensor_ir_dll))
 
 
+def _extract_appearance_features(
+    frame: np.ndarray,
+    keypoints: np.ndarray,
+    scores: np.ndarray,
+) -> list[Optional[np.ndarray]]:
+    """Build compact clothing-colour descriptors for pose identity matching.
+
+    Only the shoulder/hip quadrilateral is sampled.  This avoids faces, limbs,
+    rackets, and most of the court floor while remaining inexpensive enough to
+    run after pose inference on every frame.
+    """
+
+    import cv2
+
+    keypoints_array = np.asarray(keypoints, dtype=float)
+    scores_array = np.asarray(scores, dtype=float)
+    if keypoints_array.size == 0:
+        return []
+    if keypoints_array.ndim == 2:
+        keypoints_array = keypoints_array[None, ...]
+    if scores_array.ndim == 1:
+        scores_array = scores_array[None, ...]
+
+    height, width = frame.shape[:2]
+    features: list[Optional[np.ndarray]] = []
+    torso_indices = (5, 6, 11, 12)
+    for person_index in range(min(len(keypoints_array), len(scores_array))):
+        person_points = keypoints_array[person_index]
+        person_scores = scores_array[person_index]
+        valid = [
+            index
+            for index in torso_indices
+            if index < len(person_points)
+            and index < len(person_scores)
+            and person_scores[index] >= CONFIDENCE_THRESHOLD
+            and np.isfinite(person_points[index, :2]).all()
+        ]
+        if len(valid) < 3:
+            features.append(None)
+            continue
+
+        points = np.asarray([person_points[index, :2] for index in valid], dtype=np.float32)
+        x0 = max(0, int(np.floor(np.min(points[:, 0]) - 3.0)))
+        y0 = max(0, int(np.floor(np.min(points[:, 1]) - 3.0)))
+        x1 = min(width, int(np.ceil(np.max(points[:, 0]) + 4.0)))
+        y1 = min(height, int(np.ceil(np.max(points[:, 1]) + 4.0)))
+        if x1 - x0 < 5 or y1 - y0 < 5:
+            features.append(None)
+            continue
+
+        crop = frame[y0:y1, x0:x1]
+        local_points = points - np.asarray((x0, y0), dtype=np.float32)
+        mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+        cv2.fillConvexPoly(mask, cv2.convexHull(local_points.astype(np.int32)), 255)
+        if cv2.countNonZero(mask) < 20:
+            features.append(None)
+            continue
+
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hue_saturation = cv2.calcHist(
+            [hsv],
+            [0, 1],
+            mask,
+            [12, 4],
+            [0, 180, 0, 256],
+        ).reshape(-1)
+        value = cv2.calcHist([hsv], [2], mask, [8], [0, 256]).reshape(-1)
+        feature = np.concatenate((hue_saturation, 0.45 * value)).astype(float)
+        norm = float(np.linalg.norm(feature))
+        features.append(feature / norm if norm > 1e-8 else None)
+    return features
+
+
 def run_video_inference(
     video_path: Path,
     output_dir: Path,
@@ -571,7 +644,16 @@ def run_video_inference(
                 keypoints, scores = pose_model(frame)
                 keypoints = np.asarray(keypoints)
                 scores = np.asarray(scores)
-                results = tracker.update(keypoints, scores)
+                appearance_features = _extract_appearance_features(
+                    frame,
+                    keypoints,
+                    scores,
+                )
+                results = tracker.update(
+                    keypoints,
+                    scores,
+                    appearance_features=appearance_features,
+                )
 
                 _write_raw_rows(raw_writer, frame_id, keypoints, scores)
                 _write_tracked_rows(tracked_writer, frame_id, results)

@@ -81,6 +81,8 @@ class PoleCandidate:
     area: float
     support: float
     bbox: tuple[int, int, int, int]
+    top: np.ndarray | None = None
+    kind: str = "compact_base"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -89,6 +91,8 @@ class PoleCandidate:
             "component_area": round(float(self.area), 3),
             "support": round(float(self.support), 5),
             "bbox": list(self.bbox),
+            "top": None if self.top is None else np.round(self.top, 3).tolist(),
+            "kind": self.kind,
         }
 
 
@@ -129,7 +133,14 @@ class PoleMappedCourt:
 
 
 def detect_pole_candidates(frame_bgr: np.ndarray) -> list[PoleCandidate]:
-    """Detect compact blue/dark post bases, not arbitrary vertical Hough lines."""
+    """Detect blue post bases and complete vertical net posts.
+
+    The compact-base branch preserves the detector used by the original
+    videos.  A second, high-saturation branch detects the full narrow blue
+    post when the base is visually merged with the floor or wall.  Keeping
+    the two branches explicit avoids treating large blue wall panels as net
+    posts while allowing a new venue to calibrate without hand-picked points.
+    """
 
     height, width = frame_bgr.shape[:2]
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
@@ -168,11 +179,74 @@ def detect_pole_candidates(frame_bgr: np.ndarray) -> list[PoleCandidate]:
             )
         )
 
+    vivid_blue = cv2.inRange(
+        hsv,
+        np.array([90, 120, 60], dtype=np.uint8),
+        np.array([135, 255, 255], dtype=np.uint8),
+    )
+    vivid_blue = cv2.morphologyEx(
+        vivid_blue,
+        cv2.MORPH_CLOSE,
+        np.ones((7, 3), np.uint8),
+    )
+    tall_count, tall_labels, tall_stats, _ = cv2.connectedComponentsWithStats(vivid_blue, 8)
+    for component_id in range(1, tall_count):
+        x, y, box_width, box_height, area = map(int, tall_stats[component_id])
+        if not 80 <= area <= 10000:
+            continue
+        if box_height < max(36, int(round(0.07 * height))) or box_height > 0.42 * height:
+            continue
+        if box_width > 0.07 * width or box_height / max(1.0, box_width) < 1.55:
+            continue
+        if y + box_height < 0.52 * height or y > 0.62 * height:
+            continue
+        fill = float(area) / max(1.0, box_width * box_height)
+        if fill < 0.045:
+            continue
+
+        component_y, component_x = np.nonzero(tall_labels == component_id)
+        if len(component_x) < 20:
+            continue
+        endpoint_band = max(4, int(round(0.045 * box_height)))
+        top_mask = component_y <= y + endpoint_band
+        foot_mask = component_y >= y + box_height - 1 - endpoint_band
+        if int(top_mask.sum()) < 3 or int(foot_mask.sum()) < 3:
+            continue
+        top = np.array(
+            [np.median(component_x[top_mask]), np.median(component_y[top_mask])],
+            dtype=float,
+        )
+        foot = np.array(
+            [np.median(component_x[foot_mask]), np.median(component_y[foot_mask])],
+            dtype=float,
+        )
+        visible_height = float(foot[1] - top[1])
+        if visible_height < max(30.0, 0.055 * height):
+            continue
+        aspect_support = min(1.0, visible_height / max(1.0, 4.0 * box_width))
+        area_support = min(1.0, area / 900.0)
+        support = 0.75 + 0.45 * aspect_support + 0.35 * area_support
+        candidates.append(
+            PoleCandidate(
+                pole_id=-1,
+                foot=foot,
+                area=float(area),
+                support=float(support),
+                bbox=(x, y, box_width, box_height),
+                top=top,
+                kind="vertical_post",
+            )
+        )
+
     # Merge duplicate components from a single base and keep deterministic IDs.
-    candidates.sort(key=lambda item: (item.foot[0], item.foot[1]))
+    candidates.sort(key=lambda item: (item.foot[0], item.foot[1], item.kind))
     merged: list[PoleCandidate] = []
     for candidate in candidates:
-        if any(np.linalg.norm(candidate.foot - previous.foot) < 22.0 for previous in merged):
+        if any(
+            candidate.kind == previous.kind
+            and np.linalg.norm(candidate.foot - previous.foot) < 22.0
+            for previous in merged
+        ):
             continue
         candidate.pole_id = len(merged) + 1
         merged.append(candidate)
@@ -191,8 +265,13 @@ def _select_pole_pair(
     best: tuple[float, PoleCandidate, PoleCandidate, np.ndarray, float, float] | None = None
     ordered = sorted(poles, key=lambda pole: pole.foot[0])
     for left, right in itertools.combinations(ordered, 2):
+        both_vertical = left.kind == "vertical_post" and right.kind == "vertical_post"
+        if (left.kind == "vertical_post") != (right.kind == "vertical_post"):
+            continue
         feet_distance = float(np.linalg.norm(right.foot - left.foot))
-        if feet_distance < max(35.0, 0.035 * width) or feet_distance > 0.42 * width:
+        minimum_distance = max(35.0, (0.18 if both_vertical else 0.035) * width)
+        maximum_distance = (0.70 if both_vertical else 0.42) * width
+        if feet_distance < minimum_distance or feet_distance > maximum_distance:
             continue
         crossing = _segment_intersection(left.foot, right.foot, first_player, second_player)
         if crossing is None:
@@ -207,6 +286,8 @@ def _select_pole_pair(
         for middle in ordered:
             if middle.pole_id in (left.pole_id, right.pole_id):
                 continue
+            if middle.kind != left.kind:
+                continue
             projection = float(
                 np.dot(middle.foot - left.foot, right.foot - left.foot)
                 / max(1e-8, np.dot(right.foot - left.foot, right.foot - left.foot))
@@ -217,8 +298,11 @@ def _select_pole_pair(
         if intermediate:
             continue
         central_score = math.exp(-abs(player_ratio - 0.5) / 0.27)
-        width_score = math.exp(-abs(feet_distance - 0.12 * width) / (0.16 * width))
-        score = 3.0 * central_score + 1.4 * width_score + left.support + right.support
+        target_width = (0.48 if both_vertical else 0.12) * width
+        width_scale = (0.24 if both_vertical else 0.16) * width
+        width_score = math.exp(-abs(feet_distance - target_width) / width_scale)
+        vertical_bonus = 4.0 if both_vertical else 0.0
+        score = 3.0 * central_score + 1.4 * width_score + left.support + right.support + vertical_bonus
         if best is None or score > best[0]:
             best = (score, left, right, point, player_ratio, pole_ratio)
     if best is None:
@@ -663,15 +747,45 @@ def recompute_pnp_ground_mapping(
         [pole_feet[0], pole_feet[1], net_points[0], net_points[1]],
         dtype=np.float32,
     )
-    success, rvec, tvec = cv2.solvePnP(
+    # Four post points lie on one vertical plane, so planar PnP has two pose
+    # branches.  The lowest reprojection branch can put the camera only a few
+    # centimetres above the floor and collapse the court length.  IPPE exposes
+    # both branches; select the physically possible sports-camera solution.
+    generic = cv2.solvePnPGeneric(
         object_points,
         image_points,
         camera_matrix,
         None,
-        flags=cv2.SOLVEPNP_ITERATIVE,
+        flags=cv2.SOLVEPNP_IPPE,
     )
-    if not success:
+    if not generic[0] or not generic[1]:
         raise RuntimeError("solvePnP failed for current-frame net geometry")
+    candidates: list[tuple[float, np.ndarray, np.ndarray]] = []
+    for candidate_rvec, candidate_tvec in zip(generic[1], generic[2]):
+        candidate_rotation, _ = cv2.Rodrigues(candidate_rvec)
+        camera_center = (-candidate_rotation.T @ candidate_tvec).reshape(3)
+        camera_points = object_points @ candidate_rotation.T + candidate_tvec.reshape(1, 3)
+        projected_posts, _ = cv2.projectPoints(
+            object_points,
+            candidate_rvec,
+            candidate_tvec,
+            camera_matrix,
+            None,
+        )
+        reprojection_rms = float(
+            np.sqrt(np.mean(np.sum((projected_posts.reshape(-1, 2) - image_points) ** 2, axis=1)))
+        )
+        penalty = 0.0
+        if not 0.55 <= camera_center[2] <= 8.0:
+            penalty += 1000.0 + 100.0 * abs(float(camera_center[2]) - 1.6)
+        if np.any(camera_points[:, 2] <= 0.05):
+            penalty += 1000.0
+        # A fixed badminton recording camera normally sits outside the net
+        # plane rather than almost exactly on it.
+        if abs(float(camera_center[1])) < 1.0:
+            penalty += 250.0
+        candidates.append((reprojection_rms + penalty, candidate_rvec, candidate_tvec))
+    _, rvec, tvec = min(candidates, key=lambda item: item[0])
     rotation, _ = cv2.Rodrigues(rvec)
     homography = camera_matrix @ np.column_stack((rotation[:, 0], rotation[:, 1], tvec.reshape(3)))
     homography /= max(1e-8, float(homography[2, 2]))
@@ -744,22 +858,68 @@ def select_pole_guided_court(
     if pair is None:
         return None
     left, right, player_intersection, player_ratio, pair_score = pair
-    net_line, net_points, net_score = _select_net_edge(lines, left, right, width, height)
-    if net_line is None or net_points is None:
-        return None
     pole_feet = np.stack([left.foot, right.foot])
-    line_mapping = None
-    try:
-        line_mapping = _estimate_line_ground_mapping(
-            lines,
-            net_line,
-            pole_feet,
-            points,
-            width,
-            height,
-        )
-    except (cv2.error, RuntimeError, ValueError, np.linalg.LinAlgError):
+    vertical_pair = (
+        left.kind == "vertical_post"
+        and right.kind == "vertical_post"
+        and left.top is not None
+        and right.top is not None
+    )
+    if vertical_pair:
+        net_line = None
+        net_points = np.stack([left.top, right.top])
+        net_score = float(left.support + right.support)
+        try:
+            pnp_homography, pnp_image_corners = recompute_pnp_ground_mapping(
+                pole_feet,
+                net_points,
+                width,
+                height,
+            )
+        except (cv2.error, RuntimeError, ValueError, np.linalg.LinAlgError):
+            return None
+        net_delta = right.foot - left.foot
+        net_ground_proxy = type(
+            "DetectedPostGroundLine",
+            (),
+            {
+                "line_id": -1,
+                "x1": float(left.foot[0]),
+                "y1": float(left.foot[1]),
+                "x2": float(right.foot[0]),
+                "y2": float(right.foot[1]),
+                "angle_deg": float(
+                    math.degrees(math.atan2(float(net_delta[1]), float(net_delta[0]))) % 180.0
+                ),
+            },
+        )()
+        try:
+            line_mapping = _estimate_line_ground_mapping(
+                lines,
+                net_ground_proxy,
+                pole_feet,
+                points,
+                width,
+                height,
+            )
+        except (cv2.error, RuntimeError, ValueError, np.linalg.LinAlgError):
+            line_mapping = None
+    else:
+        net_line, net_points, net_score = _select_net_edge(lines, left, right, width, height)
+        if net_line is None or net_points is None:
+            return None
         line_mapping = None
+        try:
+            line_mapping = _estimate_line_ground_mapping(
+                lines,
+                net_line,
+                pole_feet,
+                points,
+                width,
+                height,
+            )
+        except (cv2.error, RuntimeError, ValueError, np.linalg.LinAlgError):
+            line_mapping = None
 
     if line_mapping is not None:
         homography, image_corners, mapping_diagnostics = line_mapping
@@ -767,21 +927,42 @@ def select_pole_guided_court(
         vanishing_length = np.r_[image_corners[2] - image_corners[1], 0.0]
         mapping_diagnostics = dict(mapping_diagnostics)
         mapping_diagnostics["mapping_fallback"] = False
+        if vertical_pair:
+            # Use real floor-line evidence for image<->court coordinates, but
+            # retain the metric net-post PnP projection for the 3-D camera
+            # extrinsic.  A single planar homography from noisy painted lines
+            # does not uniquely calibrate camera intrinsics.
+            mapping_diagnostics.update(
+                {
+                    "camera_calibration": "physical_pnp_from_detected_vertical_posts",
+                    "camera_pnp_image_corners": np.round(pnp_image_corners, 6).tolist(),
+                    "approximate_camera_focal_px": round(0.78 * float(width), 3),
+                }
+            )
     else:
         try:
-            homography, image_corners, vanishing_width, vanishing_length = _estimate_mapping(
-                lines,
-                net_line,
-                pole_feet,
-                net_points,
-                width,
-                height,
-            )
+            if vertical_pair:
+                homography, image_corners = pnp_homography, pnp_image_corners
+                vanishing_width = np.r_[net_points[1] - net_points[0], 0.0]
+                vanishing_length = np.r_[image_corners[2] - image_corners[1], 0.0]
+            else:
+                homography, image_corners, vanishing_width, vanishing_length = _estimate_mapping(
+                    lines,
+                    net_line,
+                    pole_feet,
+                    net_points,
+                    width,
+                    height,
+                )
         except (cv2.error, RuntimeError, ValueError, np.linalg.LinAlgError):
             # A single noisy frame must not terminate a video-wide detector run.
             return None
         mapping_diagnostics = {
-            "mapping": "fallback_pnp_from_net_width_and_height",
+            "mapping": (
+                "pnp_from_detected_vertical_posts"
+                if vertical_pair
+                else "fallback_pnp_from_net_width_and_height"
+            ),
             "approximate_camera_focal_px": round(0.78 * float(width), 3),
             "mapping_fallback": True,
             "court_length_m": 13.4,
@@ -797,7 +978,7 @@ def select_pole_guided_court(
         pole_feet=pole_feet,
         player_intersection=player_intersection,
         player_intersection_ratio=player_ratio,
-        net_line_id=net_line.line_id,
+        net_line_id=None if net_line is None else net_line.line_id,
         net_points=net_points,
         net_score=net_score,
         vanishing_width=vanishing_width,
@@ -828,6 +1009,7 @@ def annotate_pole_guided_court(
     """Draw the stable pole model and optional compact player geometry."""
 
     output = frame_bgr.copy()
+    pole_evidence = bool(court.diagnostics.get("pole_evidence", True))
     if show_court:
         polygon = np.round(court.image_corners).astype(np.int32)
         cv2.polylines(output, [polygon.reshape(-1, 1, 2)], True, (0, 0, 255), 4, cv2.LINE_AA)
@@ -848,10 +1030,11 @@ def annotate_pole_guided_court(
             2,
             cv2.LINE_AA,
         )
-    for index, point in enumerate(court.pole_feet, start=1):
-        cv2.circle(output, tuple(np.round(point).astype(int)), 8, (255, 120, 0), 3, cv2.LINE_AA)
-        if show_labels:
-            cv2.putText(output, f"POST {index}", tuple(np.round(point).astype(int) + np.array([8, -8])), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 120, 0), 2, cv2.LINE_AA)
+    if pole_evidence:
+        for index, point in enumerate(court.pole_feet, start=1):
+            cv2.circle(output, tuple(np.round(point).astype(int)), 8, (255, 120, 0), 3, cv2.LINE_AA)
+            if show_labels:
+                cv2.putText(output, f"POST {index}", tuple(np.round(point).astype(int) + np.array([8, -8])), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 120, 0), 2, cv2.LINE_AA)
     if player_points is not None:
         colors = ((0, 165, 255), (255, 180, 0))
         if show_player_pair_line:
@@ -911,7 +1094,11 @@ def annotate_pole_guided_court(
                         1,
                         cv2.LINE_AA,
                     )
-    title = f"Pole-pair court mapping | net L{court.net_line_id} | poles {court.pole_ids}"
+    if pole_evidence:
+        title = f"Pole + line court mapping | net L{court.net_line_id} | poles {court.pole_ids}"
+    else:
+        confidence = float(court.diagnostics.get("confidence", 0.0))
+        title = f"Ground-line court mapping | no posts required | confidence {confidence:.2f}"
     cv2.rectangle(output, (8, 8), (min(output.shape[1] - 8, 760), 40), (0, 0, 0), -1)
     cv2.putText(output, title, (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
     return output

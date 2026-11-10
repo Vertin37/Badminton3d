@@ -37,6 +37,7 @@ from src.court_detection import (  # noqa: E402
     annotate_pole_guided_court,
     compute_player_pole_geometry,
     recompute_pnp_ground_mapping,
+    select_line_guided_court,
     select_pole_guided_court,
 )
 from render_stable_pose_video import _draw_player, _load_points  # noqa: E402
@@ -60,14 +61,97 @@ def _read_frame(cap: cv2.VideoCapture, frame_index: int) -> tuple[bool, object]:
     return cap.read()
 
 
+def _build_temporal_median_background(
+    cap: cv2.VideoCapture,
+    frame_count: int,
+    sample_count: int,
+) -> tuple[np.ndarray | None, list[int]]:
+    """Fuse a fixed-camera video into a player-suppressed court background."""
+
+    if frame_count <= 0:
+        return None, []
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # Bound the frame stack to roughly 180 MB.  Median fusion removes moving
+    # players without requiring a second segmentation model.
+    bytes_per_frame = max(1, width * height * 3)
+    memory_bound = max(5, int(180_000_000 / bytes_per_frame))
+    count = max(5, min(int(sample_count), frame_count, memory_bound))
+    indices = list(
+        dict.fromkeys(
+            int(round(value))
+            for value in np.linspace(0, frame_count - 1, count, dtype=np.float64)
+        )
+    )
+    frames: list[np.ndarray] = []
+    accepted_indices: list[int] = []
+    for frame_index in indices:
+        ok, image = _read_frame(cap, frame_index)
+        if not ok or image is None or image.shape[:2] != (height, width):
+            continue
+        frames.append(image)
+        accepted_indices.append(frame_index)
+    if len(frames) < 5:
+        return None, accepted_indices
+    background = np.median(np.stack(frames, axis=0), axis=0).astype(np.uint8)
+    return background, accepted_indices
+
+
+def _select_metric_court(
+    image: np.ndarray,
+    lines: list[Any],
+    player_points: np.ndarray | None,
+    *,
+    allow_line_fallback: bool,
+    refine_lines: bool,
+) -> Any | None:
+    """Use posts when available, otherwise solve from metric ground lines."""
+
+    if player_points is None:
+        return None
+    model = select_pole_guided_court(image, lines, player_points)
+    if model is not None:
+        model.diagnostics = {
+            **model.diagnostics,
+            "calibration_branch": "pole_and_ground_lines",
+            "pole_evidence": True,
+        }
+        return model
+    if not allow_line_fallback:
+        return None
+    model = select_line_guided_court(
+        image,
+        lines,
+        player_points,
+        refine=refine_lines,
+    )
+    if model is not None:
+        model.diagnostics = {
+            **model.diagnostics,
+            "calibration_branch": "ground_lines_without_posts",
+        }
+    return model
+
+
 def _load_player_targets(pose_csv: Path) -> tuple[dict[int, np.ndarray], np.ndarray | None, float | None]:
-    """Load ankle-based foot centers and a robust player-connection direction."""
+    """Load ankle foot centers while rejecting background-identity takeovers.
+
+    Stable pose CSV files include ``body_scale``.  A sudden multi-fold scale
+    change is not plausible for the same player in one frame, but is typical
+    when a small spectator takes over a player ID.  Such frames are omitted;
+    callers already use the nearest valid two-player frame when needed.
+    """
 
     if not pose_csv.exists():
         return {}, None, None
     points: dict[tuple[int, int, int], tuple[float, float]] = {}
+    body_scales: dict[tuple[int, int], float] = {}
+    source_observed: dict[tuple[int, int], bool] = {}
+    has_raw_valid_column = False
     with pose_csv.open("r", encoding="utf-8-sig", newline="") as handle:
-        for row in csv.DictReader(handle):
+        reader = csv.DictReader(handle)
+        has_raw_valid_column = "raw_valid" in (reader.fieldnames or [])
+        for row in reader:
             try:
                 frame_id = int(row["frame_id"])
                 player_id = int(row["player_id"])
@@ -81,10 +165,28 @@ def _load_player_targets(pose_csv: Path) -> tuple[dict[int, np.ndarray], np.ndar
             if not (math.isfinite(x) and math.isfinite(y)):
                 continue
             points[(frame_id, player_id, keypoint_id)] = (x, y)
+            raw_valid_text = row.get("raw_valid", "")
+            if raw_valid_text == "":
+                raw_valid = True
+            else:
+                try:
+                    raw_valid = bool(int(raw_valid_text))
+                except (TypeError, ValueError):
+                    raw_valid = False
+            if raw_valid:
+                source_observed[(frame_id, player_id)] = True
+            try:
+                body_scale = float(row.get("body_scale", ""))
+            except (TypeError, ValueError):
+                body_scale = math.nan
+            if math.isfinite(body_scale) and body_scale > 1.0:
+                body_scales[(frame_id, player_id)] = body_scale
 
     frame_pairs: dict[int, np.ndarray] = {}
+    accepted_scale_history: dict[int, list[float]] = {0: [], 1: []}
+    last_observed_frame: dict[int, int | None] = {0: None, 1: None}
     for frame_id in sorted({key[0] for key in points}):
-        player_feet: list[np.ndarray] = []
+        player_feet: list[np.ndarray | None] = []
         for player_id in (0, 1):
             feet = [
                 np.asarray(points[(frame_id, player_id, keypoint_id)], dtype=float)
@@ -92,9 +194,38 @@ def _load_player_targets(pose_csv: Path) -> tuple[dict[int, np.ndarray], np.ndar
                 if (frame_id, player_id, keypoint_id) in points
             ]
             if not feet:
-                break
+                player_feet.append(None)
+                continue
+            body_scale = body_scales.get((frame_id, player_id))
+            history = accepted_scale_history[player_id]
+            previous_frame = last_observed_frame[player_id]
+            has_source_observation = source_observed.get(
+                (frame_id, player_id),
+                not has_raw_valid_column,
+            )
+            reappeared_after_gap = (
+                has_source_observation
+                and previous_frame is not None
+                and frame_id > previous_frame + 1
+            )
+            if has_source_observation:
+                last_observed_frame[player_id] = frame_id
+            if reappeared_after_gap:
+                # A real occlusion or a video edit invalidates the old image
+                # scale.  The hardened person tracker leaves such frames
+                # missing instead of filling them with a spectator, so a
+                # reappearance is a safe point to establish a new baseline.
+                history.clear()
+            if body_scale is not None and len(history) >= 8:
+                reference_scale = float(np.median(np.asarray(history[-60:], dtype=float)))
+                scale_ratio = body_scale / max(reference_scale, 1.0)
+                if scale_ratio < 0.52 or scale_ratio > 1.95:
+                    player_feet.append(None)
+                    continue
             player_feet.append(np.mean(feet, axis=0))
-        if len(player_feet) == 2:
+            if body_scale is not None:
+                history.append(body_scale)
+        if len(player_feet) == 2 and all(point is not None for point in player_feet):
             frame_pairs[frame_id] = np.stack(player_feet, axis=0)
 
     if not frame_pairs:
@@ -184,7 +315,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pole-mapping",
         action="store_true",
-        help="select adjacent pole bases by intersection with the player-foot segment and map the standard court with PnP",
+        help="metric court mapping: use posts when visible, otherwise fall back to ground-line template registration",
+    )
+    parser.add_argument(
+        "--static-camera",
+        action="store_true",
+        help="build a multi-frame median court background and reuse its calibration",
+    )
+    parser.add_argument(
+        "--background-samples",
+        type=int,
+        default=25,
+        help="number of uniformly sampled frames used by --static-camera (default: 25)",
+    )
+    parser.add_argument(
+        "--no-line-fallback",
+        action="store_true",
+        help="disable the no-post ground-line calibration branch",
     )
     return parser.parse_args()
 
@@ -800,6 +947,9 @@ def run(
     show_court: bool = True,
     show_pole_pair_line: bool = False,
     show_player_pair_line: bool = False,
+    static_camera: bool = False,
+    background_samples: int = 25,
+    allow_line_fallback: bool = True,
 ) -> dict[str, Any]:
     if not video_path.exists():
         raise FileNotFoundError(f"video not found: {video_path}")
@@ -828,6 +978,113 @@ def run(
     player_geometry_rows: list[dict[str, Any]] = []
     video_path_out: Path | None = None
     video_mapping_stats: dict[str, Any] = {}
+    video_mapping_anchor: dict[str, Any] | None = None
+    model_frame = (
+        max(0, min(video_frame_count - 1, int(reference_frame)))
+        if reference_frame is not None
+        else max(0, (video_frame_count - 1) // 2)
+    )
+    background_model: Any | None = None
+    background_indices: list[int] = []
+    if pole_mapping and static_camera and allow_line_fallback:
+        background_image, background_indices = _build_temporal_median_background(
+            cap,
+            video_frame_count,
+            background_samples,
+        )
+        if background_image is not None:
+            background_path = output_dir / "court_background_median.jpg"
+            if not cv2.imwrite(str(background_path), background_image):
+                raise RuntimeError(f"failed to write {background_path}")
+            _, background_points = _nearest_player_pair(frame_pairs, model_frame)
+            background_result = detector.detect(
+                background_image,
+                frame_index=model_frame,
+                target_player_points=None,
+            )
+            background_model = _select_metric_court(
+                background_image,
+                background_result.lines,
+                background_points,
+                allow_line_fallback=True,
+                refine_lines=True,
+            ) if background_points is not None else None
+            if background_model is not None:
+                has_poles = bool(background_model.diagnostics.get("pole_evidence", True))
+                background_model.diagnostics = {
+                    **background_model.diagnostics,
+                    "calibration_branch": (
+                        "temporal_background_poles_and_lines"
+                        if has_poles
+                        else "temporal_background_ground_lines"
+                    ),
+                    "temporal_background_samples": len(background_indices),
+                    "temporal_background_frame_indices": background_indices,
+                }
+                print(
+                    "temporal background calibration: "
+                    f"valid confidence={float(background_model.diagnostics.get('confidence', 0.0)):.3f} "
+                    f"poles={has_poles} "
+                    f"samples={len(background_indices)}"
+                )
+            else:
+                print(
+                    "[WARN] temporal background did not produce a confident ground-line calibration; "
+                    "per-frame branches remain enabled"
+                )
+        # A median background is ideal for floor lines, but thin posts can be
+        # blurred by compression and temporal fusion.  Probe a small set of
+        # real frames and prefer the strongest physical two-post calibration
+        # when one exists.  If both posts are outside the shot this simply
+        # leaves the post-free background calibration in place.
+        probe_indices = {model_frame}
+        if background_indices:
+            probe_positions = np.linspace(
+                0,
+                len(background_indices) - 1,
+                min(7, len(background_indices)),
+                dtype=int,
+            )
+            probe_indices.update(background_indices[int(position)] for position in probe_positions)
+        pole_models: list[tuple[int, Any]] = []
+        for probe_index in sorted(probe_indices):
+            ok, probe_image = _read_frame(cap, probe_index)
+            if not ok or probe_image is None:
+                continue
+            _, probe_points = _nearest_player_pair(frame_pairs, probe_index)
+            if probe_points is None:
+                continue
+            probe_result = detector.detect(
+                probe_image,
+                frame_index=probe_index,
+                target_player_points=None,
+            )
+            probe_model = _select_metric_court(
+                probe_image,
+                probe_result.lines,
+                probe_points,
+                allow_line_fallback=False,
+                refine_lines=False,
+            )
+            if probe_model is not None and bool(probe_model.diagnostics.get("pole_evidence", True)):
+                pole_models.append((probe_index, probe_model))
+        if pole_models:
+            best_probe_index, best_pole_model = max(
+                pole_models,
+                key=lambda item: float(item[1].score),
+            )
+            best_pole_model.diagnostics = {
+                **best_pole_model.diagnostics,
+                "calibration_branch": "static_probe_poles_and_lines",
+                "static_probe_frame": int(best_probe_index),
+                "static_probe_count": int(len(probe_indices)),
+                "temporal_background_samples": int(len(background_indices)),
+            }
+            background_model = best_pole_model
+            print(
+                "static calibration upgraded with physical posts: "
+                f"frame={best_probe_index} score={float(best_pole_model.score):.3f}"
+            )
     try:
         for frame_index in indices:
             ok, image = _read_frame(cap, frame_index)
@@ -843,11 +1100,22 @@ def run(
                 ),
                 target_axis_angle_deg=None if pole_mapping else player_axis_angle if use_target_filter else None,
             )
-            mapped_court = (
-                select_pole_guided_court(image, result.lines, player_points)
-                if pole_mapping and use_target_filter and player_points is not None
-                else None
-            )
+            mapped_court = None
+            if pole_mapping and use_target_filter and player_points is not None:
+                if static_camera and background_model is not None:
+                    mapped_court = copy.deepcopy(background_model)
+                    mapped_court.diagnostics = {
+                        **mapped_court.diagnostics,
+                        "calibration_branch": "temporal_background_reuse",
+                    }
+                else:
+                    mapped_court = _select_metric_court(
+                        image,
+                        result.lines,
+                        player_points,
+                        allow_line_fallback=allow_line_fallback,
+                        refine_lines=True,
+                    )
             target_selected = mapped_court is not None if pole_mapping else result.target_court is not None
             if pole_mapping and mapped_court is not None:
                 geometry = compute_player_pole_geometry(mapped_court, player_points, frame_index)
@@ -878,6 +1146,7 @@ def run(
 
             record = result.as_dict()
             record["pole_mapped_court"] = None if mapped_court is None else mapped_court.as_dict()
+            record["court_mapping"] = record["pole_mapped_court"]
             record["player_pole_geometry"] = geometry
             record["annotated_image"] = str(output_path)
             record["target_pose_frame"] = pose_frame
@@ -889,7 +1158,7 @@ def run(
                 role_counts[line.role] = role_counts.get(line.role, 0) + 1
             if pole_mapping and mapped_court is not None:
                 print(
-                    f"frame={frame_index} pole-pair={mapped_court.pole_ids} "
+                    f"frame={frame_index} branch={mapped_court.diagnostics.get('calibration_branch')} "
                     f"net={mapped_court.net_line_id} cross_ratio={mapped_court.player_intersection_ratio:.2f} "
                     f"score={mapped_court.score:.2f}"
                 )
@@ -912,60 +1181,76 @@ def run(
 
         if all_frames or video_output is not None:
             video_path_out = video_output or (output_dir / "court_detection_video.mp4")
-            model_frame = (
-                max(0, min(video_frame_count - 1, int(reference_frame)))
-                if reference_frame is not None
-                else max(0, (video_frame_count - 1) // 2)
-            )
             video_path_out.parent.mkdir(parents=True, exist_ok=True)
 
             if pole_mapping:
-                # The camera is not fixed.  Detect the target poles and net on
-                # every frame, then track the selected pair from the trusted
-                # reference frame so a neighbouring court cannot take over.
                 raw_models: list[Any | None] = []
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                for detection_frame_index in range(video_frame_count):
-                    ok, detection_image = cap.read()
-                    if not ok or detection_image is None:
-                        raw_models.append(None)
-                        continue
-                    _, detection_points = _nearest_player_pair(frame_pairs, detection_frame_index)
-                    detection_result = detector.detect(
-                        detection_image,
-                        frame_index=detection_frame_index,
-                        target_player_points=None,
+                if static_camera and background_model is not None:
+                    # A fixed camera has exactly one image-to-court transform.
+                    # Re-running detection on every frame only introduces
+                    # assignment jitter and wastes most of the runtime.
+                    for detection_frame_index in range(video_frame_count):
+                        model = copy.deepcopy(background_model)
+                        model.diagnostics = {
+                            **model.diagnostics,
+                            "calibration_branch": "temporal_background_reuse",
+                            "background_reused_for_frame": int(detection_frame_index),
+                        }
+                        raw_models.append(model)
+                    majority_correction_count = 0
+                    tracked_models = raw_models
+                    mapping_anchor_frame = model_frame
+                    print(
+                        "fixed-camera court mapping: reused one calibration for "
+                        f"{video_frame_count} frames"
                     )
-                    model = (
-                        select_pole_guided_court(
+                else:
+                    # Moving-camera mode detects every frame and tracks the
+                    # selected geometry from a trusted anchor.
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    for detection_frame_index in range(video_frame_count):
+                        ok, detection_image = cap.read()
+                        if not ok or detection_image is None:
+                            raw_models.append(None)
+                            continue
+                        _, detection_points = _nearest_player_pair(frame_pairs, detection_frame_index)
+                        detection_result = detector.detect(
                             detection_image,
-                            detection_result.lines,
-                            detection_points,
+                            frame_index=detection_frame_index,
+                            target_player_points=None,
                         )
-                        if use_target_filter and detection_points is not None
-                        else None
-                    )
-                    raw_models.append(model)
-                    if (detection_frame_index + 1) % 25 == 0 or detection_frame_index == video_frame_count - 1:
-                        print(
-                            f"per-frame court mapping: {detection_frame_index + 1}/{video_frame_count} "
-                            f"valid={sum(item is not None for item in raw_models)}"
+                        model = (
+                            _select_metric_court(
+                                detection_image,
+                                detection_result.lines,
+                                detection_points,
+                                allow_line_fallback=allow_line_fallback,
+                                refine_lines=False,
+                            )
+                            if use_target_filter and detection_points is not None
+                            else None
                         )
+                        raw_models.append(model)
+                        if (detection_frame_index + 1) % 25 == 0 or detection_frame_index == video_frame_count - 1:
+                            print(
+                                f"per-frame court mapping: {detection_frame_index + 1}/{video_frame_count} "
+                                f"valid={sum(item is not None for item in raw_models)}"
+                            )
 
-                raw_models, majority_correction_count = _correct_majority_geometry_outliers(raw_models)
-                tracked_models, mapping_anchor_frame = _track_pole_models(
-                    raw_models,
-                    model_frame,
-                    video_width,
-                    video_height,
-                )
-                # Smooth the tracked court in a coordinate system attached to
-                # the selected net.  This suppresses line-assignment jitter
-                # without freezing the court at a fixed image location.
-                tracked_models = _smooth_tracked_pole_models(
-                    tracked_models,
-                    mapping_anchor_frame,
-                )
+                    raw_models, majority_correction_count = _correct_majority_geometry_outliers(raw_models)
+                    tracked_models, mapping_anchor_frame = _track_pole_models(
+                        raw_models,
+                        model_frame,
+                        video_width,
+                        video_height,
+                    )
+                    # Smooth the tracked court in a coordinate system attached
+                    # to the selected net.  This suppresses line-assignment
+                    # jitter without freezing a genuinely moving camera.
+                    tracked_models = _smooth_tracked_pole_models(
+                        tracked_models,
+                        mapping_anchor_frame,
+                    )
                 player_geometry_by_frame: dict[int, list[dict[str, Any]]] = {}
                 for model_index, tracked_model in enumerate(tracked_models):
                     if tracked_model is None:
@@ -986,8 +1271,12 @@ def run(
                     "total_frames": int(len(raw_models)),
                     "tracked_model_frames": int(sum(item is not None for item in tracked_models)),
                     "anchor_frame": mapping_anchor_frame,
-                    "recomputed_per_frame": True,
-                    "temporal_filter": "pole_pair_motion_gate_and_adaptive_blend",
+                    "recomputed_per_frame": not (static_camera and background_model is not None),
+                    "temporal_filter": (
+                        "fixed_camera_single_calibration"
+                        if static_camera and background_model is not None
+                        else "pole_pair_motion_gate_and_adaptive_blend"
+                    ),
                     "majority_geometry_corrections": int(majority_correction_count),
                     "line_ground_homography_frames": int(
                         sum(
@@ -1003,7 +1292,29 @@ def run(
                             for item in raw_models
                         )
                     ),
+                    "pole_observation_frames": int(
+                        sum(
+                            item is not None
+                            and bool(item.diagnostics.get("pole_evidence", True))
+                            for item in raw_models
+                        )
+                    ),
+                    "ground_line_only_frames": int(
+                        sum(
+                            item is not None
+                            and not bool(item.diagnostics.get("pole_evidence", True))
+                            for item in raw_models
+                        )
+                    ),
+                    "temporal_background_used": bool(background_model is not None),
+                    "temporal_background_samples": int(len(background_indices)),
                 }
+                if mapping_anchor_frame is not None and tracked_models[mapping_anchor_frame] is not None:
+                    video_mapping_anchor = {
+                        "frame_index": int(mapping_anchor_frame),
+                        "pole_mapped_court": tracked_models[mapping_anchor_frame].as_dict(),
+                        "court_mapping": tracked_models[mapping_anchor_frame].as_dict(),
+                    }
                 if mapping_anchor_frame is None:
                     print("[WARN] no usable per-frame pole/net model; video will show pose only")
                 else:
@@ -1063,7 +1374,7 @@ def run(
                         )
                         cv2.putText(
                             annotated,
-                            f"Per-frame pole mapping | anchor {anchor_text} | video frame {video_frame_index}",
+                            f"Metric court mapping | anchor {anchor_text} | video frame {video_frame_index}",
                             (16, 66),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.48,
@@ -1147,6 +1458,7 @@ def run(
     player_geometry_metadata = _write_player_geometry_outputs(output_dir, player_geometry_rows)
 
     metadata = {
+        "court_mapping_schema": 3,
         "video": str(video_path),
         "frame_count": video_frame_count,
         "fps": video_fps,
@@ -1157,24 +1469,28 @@ def run(
         "player_guided": bool(use_target_filter and bool(frame_pairs)),
         "player_axis_angle_deg": player_axis_angle,
         "target_description": (
-            "adjacent pole bases whose connecting segment intersects the two-player foot segment; "
-            "standard 13.4m x 6.1m court projected with pole-guided court-line Homography; guarded net-only PnP fallback"
+            "standard 13.4m x 6.1m court registered from metric ground-line geometry; "
+            "visible net posts are optional high-confidence constraints; multi-frame background is used for fixed cameras"
             if pole_mapping
             else "player corridor -> net edge -> two posts -> visible or synthesized court long edges; image-space only"
         ),
         "mapping_mode": (
-            "pole_pair_line_ground_homography_per_frame_with_temporal_pair_tracking"
+            "hybrid_ground_line_and_optional_pole_homography_with_temporal_tracking"
             if pole_mapping
             else "legacy_player_guided_image_space"
         ),
         "per_frame_mapping": bool(pole_mapping and (all_frames or video_output is not None)),
         "video_output": None if video_path_out is None else str(video_path_out),
         "video_mapping_stats": video_mapping_stats,
+        "video_mapping_anchor": video_mapping_anchor,
         "player_pole_geometry": player_geometry_metadata,
         "render_options": {
             "show_court": bool(show_court),
             "show_pole_pair_line": bool(show_pole_pair_line),
             "show_player_pair_line": bool(show_player_pair_line),
+            "static_camera": bool(static_camera),
+            "line_fallback": bool(allow_line_fallback),
+            "background_samples": int(background_samples),
         },
         "frames": records,
         "scope": "2-D court/pole tracking plus ground-plane player-to-pole geometry; no full camera or human 3-D reconstruction",
@@ -1205,6 +1521,9 @@ def main() -> None:
         show_court=not args.hide_court,
         show_pole_pair_line=args.show_pole_pair_line,
         show_player_pair_line=args.show_player_pair_line,
+        static_camera=args.static_camera,
+        background_samples=args.background_samples,
+        allow_line_fallback=not args.no_line_fallback,
     )
 
 

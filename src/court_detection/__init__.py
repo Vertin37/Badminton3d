@@ -1,6 +1,7 @@
 """Automatic badminton-court line detection utilities."""
 
 from .detector import CourtDetectionResult, CourtDetectorConfig, CourtLine, CourtLineDetector
+from .line_mapper import LineMappingConfig, score_court_homography, select_line_guided_court
 from .pole_mapper import (
     PoleCandidate,
     PoleMappedCourt,
@@ -17,6 +18,9 @@ __all__ = [
     "CourtDetectorConfig",
     "CourtLine",
     "CourtLineDetector",
+    "LineMappingConfig",
+    "score_court_homography",
+    "select_line_guided_court",
     "SelectedCourt",
     "PoleCandidate",
     "PoleMappedCourt",
