@@ -2,14 +2,24 @@
 
 面向单目羽毛球比赛视频的视觉分析与三维人体运动恢复项目。项目当前聚焦于建立一条可复现的 Windows 原生流程：从双人二维姿态和球场几何出发，恢复稳定的球员轨迹，并验证 world-grounded human motion recovery 在羽毛球快速移动与起跳动作中的可用性。
 
-## 发布范围与完整三维入口
+## 最新默认管线：人物、球场与三维对齐
 
-本次更新包含稳定双人二维姿态与身份跟踪、官方 GVHMR/SMPL-X 三维恢复、
+`integrated_scene_v1` 将 RTMLib、人物辅助的纯几何球场识别、球场反向筛人、冻结 GVHMR 和脚接触/根轨迹对齐整合为同一可复现流程。自动选场和分段，无需手工球场标点；模型及许可资产由本地提供。
+
+```powershell
+python run_scene_pipeline.py --video path/to/match.mp4 --output outputs/match_integrated --resume
+```
+
+首次使用请按 [统一管线说明](docs/integrated_scene_pipeline.md) 配置环境、上游权重及男性展示资产。该说明包含完整命令、数据流、双向反馈保护、输出文件和断点恢复规则；[实际验证记录](docs/integrated_scene_validation.md) 记录回归结果与适用范围。
+
+## 历史稳定三维入口（保留）
+
+历史版本包含稳定双人二维姿态与身份跟踪、官方 GVHMR/SMPL-X 三维恢复、
 Metric Video Depth Anything 时序深度、整段多线索轨迹融合、支撑脚接触修正和 Open3D 回放。
 保留这些流程依赖的传统球场几何标定接口。
 
 近期独立研究的球场学习模型、数据采集与标注工具、训练/评测记录、多视角球场识别和
-Good-Badminton 对照实验未包含在本次发布中。原视频、模型权重、标注数据、推理缓存和
+Good-Badminton 对照实验未包含在仓库中。原视频、模型权重、标注数据、推理缓存和
 生成结果继续由本地保存。
 
 已准备好本机三个独立环境及官方模型后，可运行：
@@ -27,6 +37,12 @@ python work/run_badminton_3d_pipeline.py --video path/to/input.mp4 --output-dir 
 保留了方法边界和历史结果；文中的“不上传”记录描述的是当时实验状态。
 
 ## 当前进度
+
+### 最新：人物—球场—三维对齐统一管线
+
+当前入口为 `python run_scene_pipeline.py --video <视频> --output <结果目录> --resume`。人物轨迹与置信度参与球场选场和拟合，可信球场再反馈筛选目标人物；通过场线和漂移检查后接入冻结 GVHMR、共享相机和脚接触优化。没有球场神经网络，也不手动标点或逐帧改姿态。
+
+支持独立环境、任意视频路径、完整回放、自动分段和内容指纹缓存。模型及许可资产需自行准备。见 [完整管线说明与运行命令](docs/integrated_scene_pipeline.md) 和 [实际验证记录](docs/integrated_scene_validation.md)。下方旧命令作为历史流程保留。
 
 ### 已完成：稳定二维人体与球场分析
 

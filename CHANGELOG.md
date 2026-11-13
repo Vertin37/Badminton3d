@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-13 — Integrated person/court scene pipeline
+
+- Added a portable, resumable entry point with versioned configuration and explicit stage contracts.
+- Integrated target-person observations into geometric court fitting and bounded court-to-person feedback, including airborne-ankle protection and rejection of unsupported/drifting geometry.
+- Connected official frozen GVHMR, metric scene-camera initialization, support-foot/root optimization and slim-male display; preserved recovered articulation.
+- Separated detected 2-D court overlays from the aligned 3-D court projection for honest visual review.
+- Added content-verified caches, regression tests, actual-video validation notes and full pipeline documentation. Excluded licensed assets, videos and caches.
+
 ## 2026-11-10 — Stable 3D workflow publication
 
 - Added the automatic video-to-3D pipeline, fixed-camera GVHMR handling, and tracked calibration export.

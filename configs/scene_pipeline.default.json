@@ -1,0 +1,14 @@
+{
+  "version": "integrated_scene_v1",
+  "selection": {
+    "floor_hue_min": 30,
+    "floor_hue_max": 100,
+    "min_body_height_fraction": 0.08,
+    "cut_jump_fraction": 0.28,
+    "court_feedback_margin_m": 2.0,
+    "airborne_image_drop_fraction": 0.35
+  },
+  "fusion": {"max_passes": 2, "max_corner_shift_px_at960": 45.0},
+  "native": {"feature_batch_size": 4, "focal_mm": 24},
+  "render": {"fps": 15, "avatar": "male_slim"}
+}

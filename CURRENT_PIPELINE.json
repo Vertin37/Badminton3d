@@ -1,0 +1,12 @@
+{
+  "version": "integrated_scene_v1",
+  "entry_point": "run_scene_pipeline.py",
+  "config": "configs/scene_pipeline.default.json",
+  "documentation": "docs/integrated_scene_pipeline.md",
+  "person_backend": "RTMLib + official frozen GVHMR",
+  "court_backend": "geometry with target-person observations",
+  "court_network_used": false,
+  "bidirectional_feedback": "bounded two-pass with line, metric and drift guards",
+  "manual_court_or_player_points": false,
+  "articulation_changed_during_alignment": false
+}

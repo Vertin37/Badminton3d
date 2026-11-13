@@ -1,0 +1,9 @@
+# CPU selection/court/alignment/render helpers.
+# Install PyTorch/CUDA and official GVHMR dependencies in the HMR environment
+# separately, following the upstream project. RTMLib uses the pose environment.
+numpy>=1.23.5,<2
+scipy>=1.10
+opencv-python>=4.8,<4.12
+av>=12
+Pillow>=9
+smplx>=0.1.28

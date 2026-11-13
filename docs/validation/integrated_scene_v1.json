@@ -1,0 +1,77 @@
+{
+  "version": "integrated_scene_v1",
+  "date": "2026-11-13",
+  "source": "https://www.bilibili.com/video/BV1AsW465EL4/",
+  "source_range_seconds": [
+    0,
+    60
+  ],
+  "frames": 1800,
+  "resolution": [
+    1920,
+    1080
+  ],
+  "render_frames": 900,
+  "render_fps": 15,
+  "manual_points": false,
+  "court_network_used": false,
+  "native_parameters_imported_only_after_exact_input_verification": true,
+  "fresh_native_smoke_frames_per_person": 32,
+  "regression_tests_passed": 51,
+  "metric_type": "input consistency proxies; not 3D ground truth",
+  "shots": [
+    {
+      "start_frame": 0,
+      "end_frame": 396,
+      "body_mean_px": 12.709168266705126,
+      "court_mean_px": 16.79632260265305,
+      "baseline_body_mean_px": 12.70916779696549,
+      "baseline_court_mean_px": 16.796337444031614
+    },
+    {
+      "start_frame": 396,
+      "end_frame": 587,
+      "body_mean_px": 12.771462171591704,
+      "court_mean_px": 18.078687500969856,
+      "baseline_body_mean_px": 12.771461457054064,
+      "baseline_court_mean_px": 18.07874008621003
+    },
+    {
+      "start_frame": 587,
+      "end_frame": 1267,
+      "body_mean_px": 12.797557484856181,
+      "court_mean_px": 30.573952093674013,
+      "baseline_body_mean_px": 12.79755280702233,
+      "baseline_court_mean_px": 30.574508560940572
+    },
+    {
+      "start_frame": 1267,
+      "end_frame": 1769,
+      "body_mean_px": 12.82905653723882,
+      "court_mean_px": 37.34541614328617,
+      "baseline_body_mean_px": 12.829056929825688,
+      "baseline_court_mean_px": 37.34548918096043
+    },
+    {
+      "start_frame": 1769,
+      "end_frame": 1800,
+      "body_mean_px": 12.942590947402383,
+      "court_mean_px": 32.293091338642434,
+      "baseline_body_mean_px": 12.942590407108954,
+      "baseline_court_mean_px": 32.29298277085215
+    }
+  ],
+  "validation_scope": {
+    "bilibili_60s": "full fusion/alignment/render regression, raw detection reused",
+    "test2": "CPU person/court regression, existing stable 2D observations supplied",
+    "native_fresh32": "fresh HMR2 and GVHMR GPU backend smoke test; no parameter-cache import",
+    "detection_fresh32": "fresh RTMLib detection backend smoke; all 32 source frames processed"
+  },
+  "upstream_gvhmr_commit": "6ec3ca39336c50492c0fae65fba2fb831fc7d866",
+  "fresh_detection_smoke_frames": 32,
+  "source_video_sha256": "ae13a439a68760b3a476be455fc42714aa1c8e4c27a6b751c4d26deb22126dfb",
+  "resume_all_stage_cache_hits": 7,
+  "native_articulation_preserved": true,
+  "complete_video_decode_passed": true,
+  "proper_rotation_and_positive_camera_height": true
+}

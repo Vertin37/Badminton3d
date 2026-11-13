@@ -25,6 +25,11 @@ examples/data/*
 *.pth
 *.onnx
 *.safetensors
+*.npz
+*.npy
+*.pkl
+*.ckpt
+*.log
 .cache/
 
 # Local-only model archive and upstream checkout (kept on this Windows PC).
@@ -40,3 +45,7 @@ work/court_calibration/_vendor/
 .env
 *.local.toml
 *.local.json
+
+# External scene assets and local inference environments.
+inputs/checkpoints/
+models_smplx*/
